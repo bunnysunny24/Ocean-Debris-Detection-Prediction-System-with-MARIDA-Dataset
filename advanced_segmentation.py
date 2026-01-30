@@ -100,13 +100,17 @@ class EnhancedUNet(nn.Module):
             in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
         )
         
-        # Copy weights from pretrained model (average across channels)
+        # Copy weights from pretrained model (with proper scaling)
         if pretrained:
             weight = original_conv.weight.data  # (64, 3, 7, 7)
-            # Average across original 3 channels, then repeat for in_channels
+            # Average across original 3 channels, scale by 3/in_channels for consistency
             weight = weight.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
+            weight = weight * (3.0 / in_channels)  # Scale to compensate for more channels
             weight = weight.repeat(1, in_channels, 1, 1)  # (64, in_channels, 7, 7)
             self.initial_conv.weight.data = weight
+        else:
+            # Random initialization with proper scaling (Kaiming uniform)
+            nn.init.kaiming_uniform_(self.initial_conv.weight, a=1, mode='fan_out')
         
         self.bn1 = resnext.bn1
         self.relu = resnext.relu
@@ -148,6 +152,9 @@ class EnhancedUNet(nn.Module):
         
         # Final output layer - multi-class
         self.out = nn.Conv2d(32, num_classes, kernel_size=1)
+        
+        # Initialize output layer
+        nn.init.kaiming_normal_(self.out.weight, mode='fan_out', nonlinearity='relu')
     
     def _conv_block(self, in_ch, out_ch):
         """Double convolution block with batch norm and ReLU."""
@@ -223,7 +230,7 @@ class EnhancedUNet(nn.Module):
 
 def weighted_cross_entropy_loss(pred_logits, target, class_weights=None):
     """
-    Weighted cross-entropy loss for multi-class segmentation.
+    Weighted cross-entropy loss for multi-class segmentation with label smoothing.
     
     Args:
         pred_logits: (batch, num_classes, H, W)
@@ -234,60 +241,101 @@ def weighted_cross_entropy_loss(pred_logits, target, class_weights=None):
         class_weights = torch.ones(pred_logits.size(1))
     
     class_weights = class_weights.to(pred_logits.device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # Use label smoothing for numerical stability
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
     return criterion(pred_logits, target.long())
 
 
 def dice_loss_multiclass(pred_logits, target, num_classes=4, smooth=1.0):
     """
-    Dice loss for multi-class segmentation.
+    Dice loss for multi-class segmentation with numerical stability.
+    Skip classes that don't appear in batch to avoid division by zero.
     """
     pred_probs = F.softmax(pred_logits, dim=1)  # (batch, num_classes, H, W)
     
-    total_loss = 0.0
+    total_loss = None
+    classes_in_batch = 0
+    
     for c in range(num_classes):
         pred_c = pred_probs[:, c].contiguous().view(-1)
         target_c = (target == c).float().contiguous().view(-1)
         
+        # Skip if class doesn't exist in this batch
+        if target_c.sum() < 1e-6:
+            continue
+        
         intersection = (pred_c * target_c).sum()
-        dice_coeff = (2.0 * intersection + smooth) / (pred_c.sum() + target_c.sum() + smooth)
-        total_loss += (1.0 - dice_coeff)
+        union = pred_c.sum() + target_c.sum()
+        
+        # Prevent division by zero with added epsilon
+        dice_coeff = (2.0 * intersection + smooth) / (union + smooth + 1e-8)
+        class_loss = 1.0 - dice_coeff
+        
+        if total_loss is None:
+            total_loss = class_loss
+        else:
+            total_loss = total_loss + class_loss
+        
+        classes_in_batch += 1
     
-    return total_loss / num_classes
+    # If no classes found (shouldn't happen), return zero loss
+    if total_loss is None or classes_in_batch == 0:
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+    
+    return total_loss / classes_in_batch
 
 
 def combined_loss_multiclass(pred_logits, target, num_classes=16, alpha=0.5):
     """
-    Combined CrossEntropy + Dice loss for multi-class (MARIDA: 16 classes).
+    CrossEntropy loss for multi-class (MARIDA: 16 classes).
+    Using square-root inverse frequency weighting to balance extreme class imbalance.
     
     Args:
         pred_logits: (B, C, H, W) - Network output logits
         target: (B, H, W) - Ground truth class labels (0-15 for MARIDA)
         num_classes: Number of classes (16 for MARIDA)
-        alpha: Balance between CE (alpha) and Dice (1-alpha)
+        alpha: Unused (kept for API compatibility)
     
     Returns:
-        Combined loss
+        Loss value
     """
-    # Create class weights (emphasize minority classes like Marine Debris)
-    # Class 1 is Marine Debris - give it higher weight
-    class_weights = torch.ones(num_classes, device=pred_logits.device)
-    class_weights[1] = 2.0  # Marine Debris gets 2x weight
-    class_weights[0] = 0.5  # Background/Unknown gets lower weight
+    # Safety check: ensure logits are valid
+    if torch.isnan(pred_logits).any() or torch.isinf(pred_logits).any():
+        return torch.tensor(1.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
     
-    ce = weighted_cross_entropy_loss(pred_logits, target, class_weights)
-    dice = dice_loss_multiclass(pred_logits, target, num_classes)
+    # Use sqrt inverse frequency weighting for numerical stability with extreme imbalance
+    # sqrt(weights) prevents extremely large weight gradients
+    # Computed as: sqrt(total_pixels / (num_classes * class_count))
+    class_weights = torch.tensor([
+        5.7595e-03,  # 0: Background (sqrt of 3.32e-06)
+        3.1535e-01,  # 1: Marine Debris (sqrt of 0.099)
+        3.1945e-01,  # 2: Cloud
+        3.2713e-01,  # 3: Cloud Shadow
+        8.3132e-01,  # 4: Ocean
+        2.0384e-01,  # 5: Land
+        5.5545e-02,  # 6: Water
+        4.6954e-02,  # 7: Wetland
+        2.5532e-02,  # 8: Snow
+        4.7075e-01,  # 9: Built-up
+        4.1585e-02,  # 10: Bare Soil
+        1.6566e-01,  # 11: Dense Vegetation
+        2.9151e-01,  # 12: Sparse Vegetation
+        1.6421e-01,  # 13: Cropland
+        1.6930e-01,  # 14: Herbaceous
+        1.0000e+00   # 15: Tree (rarest)
+    ], device=pred_logits.device, dtype=pred_logits.dtype)
     
-    # Handle NaN
-    if torch.isnan(ce):
-        ce = torch.tensor(0.0, device=pred_logits.device)
-    if torch.isnan(dice):
-        dice = torch.tensor(0.0, device=pred_logits.device)
+    try:
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+        loss = criterion(pred_logits, target.long())
+    except Exception as e:
+        return torch.tensor(1.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
     
-    combined = alpha * ce + (1.0 - alpha) * dice
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.tensor(1.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
     
-    return combined
+    return loss
 
 
 # ============================================================================

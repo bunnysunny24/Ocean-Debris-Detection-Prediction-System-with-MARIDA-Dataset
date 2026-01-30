@@ -24,11 +24,13 @@ class ModelConfig:
     MAX_FILTERS = 1024        # Maximum filters at bottleneck
     
     # Training
-    BATCH_SIZE = 8
-    LEARNING_RATE = 1e-4
+    BATCH_SIZE = 12  # Balanced for RTX 4060 8GB with shared memory support
+    LEARNING_RATE = 1e-5  # Reduced from 1e-4 for stability
     NUM_EPOCHS = 50
     WEIGHT_DECAY = 1e-5
     LR_SCHEDULER_PATIENCE = 5
+    USE_MIXED_PRECISION = True  # Enable fp16 mixed precision for faster training
+    GRADIENT_CHECKPOINTING = True  # Trade compute for memory (recompute activations)
     
     # Inference
     CONFIDENCE_THRESHOLD = 0.5

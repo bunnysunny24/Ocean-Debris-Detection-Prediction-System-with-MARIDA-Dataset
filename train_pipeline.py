@@ -28,27 +28,51 @@ def train_epoch(model, train_loader, optimizer, device):
     Returns:
         Average training loss for the epoch
     """
-    model.train()
+    model.train()  # Explicitly set to train mode
     total_loss = 0.0
+    batch_count = 0
+    skip_count = 0
     
     with tqdm(train_loader, desc="Training", leave=False) as pbar:
         for images, masks in pbar:
-            images = images.to(device)
-            masks = masks.to(device)
+            images = images.to(device).float()  # Ensure float type
+            masks = masks.to(device).long()     # Ensure long type for class labels
             
             # Forward pass
             optimizer.zero_grad()
             outputs = model(images)
+            
+            # Check for NaN in outputs
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                skip_count += 1
+                pbar.update(1)
+                continue
+            
             loss = combined_loss_multiclass(outputs, masks)  # Multi-class loss for MARIDA (16 classes)
             
-            # Backward pass
+            # Check for NaN/Inf before backward
+            if torch.isnan(loss) or torch.isinf(loss):
+                skip_count += 1
+                pbar.update(1)
+                continue
+            
+            # Backward pass with aggressive gradient clipping
             loss.backward()
+            
+            # Clip gradients before update
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=0.5)
+            
             optimizer.step()
             
             total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            batch_count += 1
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'skip': skip_count})
     
-    return total_loss / len(train_loader)
+    if batch_count == 0:
+        print(f"\n  ⚠ Warning: All {skip_count} batches skipped due to NaN/Inf")
+        return 0.0
+    return total_loss / batch_count
 
 
 def validate_epoch(model, val_loader, device):
@@ -58,27 +82,27 @@ def validate_epoch(model, val_loader, device):
     Returns:
         Average validation loss for the epoch
     """
-    model.eval()
+    model.eval()  # Explicitly set to eval mode
     total_loss = 0.0
     batch_count = 0
     
     with torch.no_grad():
         with tqdm(val_loader, desc="Validation", leave=False) as pbar:
             for images, masks in pbar:
-                images = images.to(device)
-                masks = masks.to(device)
+                images = images.to(device).float()  # Ensure float type
+                masks = masks.to(device).long()     # Ensure long type for class labels
                 
                 outputs = model(images)
                 # Use multi-class loss for MARIDA dataset (16 classes)
                 loss = combined_loss_multiclass(outputs, masks)
                 
                 # Skip NaN losses
-                if not torch.isnan(loss):
+                if not torch.isnan(loss) and not torch.isinf(loss):
                     total_loss += loss.item()
                     batch_count += 1
                     pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
                 else:
-                    pbar.set_postfix({'val_loss': 'NaN'})
+                    pbar.set_postfix({'val_loss': 'NaN/Inf'})
     
     if batch_count == 0:
         return float('nan')
