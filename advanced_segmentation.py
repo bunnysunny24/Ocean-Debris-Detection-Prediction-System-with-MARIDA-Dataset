@@ -300,9 +300,33 @@ def combined_loss_multiclass(pred_logits, target, num_classes=16, alpha=0.5):
     Returns:
         Loss value
     """
-    # Safety check: ensure logits are valid
+    # ========== COMPREHENSIVE VALIDATION ==========
+    
+    # Check shapes
+    if len(pred_logits.shape) != 4:
+        print(f"  ⚠ pred_logits has wrong shape: {pred_logits.shape}, expected (B, C, H, W)")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+    
+    if len(target.shape) != 3:
+        print(f"  ⚠ target has wrong shape: {target.shape}, expected (B, H, W)")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+    
+    # Check batch size and spatial dims match
+    if pred_logits.shape[0] != target.shape[0] or pred_logits.shape[2:] != target.shape[1:]:
+        print(f"  ⚠ Shape mismatch: pred {pred_logits.shape} vs target {target.shape}")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+    
+    # Check NaN/Inf in logits
     if torch.isnan(pred_logits).any() or torch.isinf(pred_logits).any():
-        return torch.tensor(1.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+        print(f"  ⚠ NaN/Inf in pred_logits")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+    
+    # Check target is within valid range [0, num_classes)
+    target_long = target.long()
+    target_min, target_max = target_long.min().item(), target_long.max().item()
+    if target_min < 0 or target_max >= num_classes:
+        print(f"  ⚠ Target out of range: min={target_min}, max={target_max}, expected [0, {num_classes-1}]")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
     
     # Use sqrt inverse frequency weighting for numerical stability with extreme imbalance
     # sqrt(weights) prevents extremely large weight gradients
@@ -328,12 +352,14 @@ def combined_loss_multiclass(pred_logits, target, num_classes=16, alpha=0.5):
     
     try:
         criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        loss = criterion(pred_logits, target.long())
+        loss = criterion(pred_logits, target_long)
     except Exception as e:
-        return torch.tensor(1.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+        print(f"  ⚠ CrossEntropyLoss exception: {str(e)[:100]}")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
     
     if torch.isnan(loss) or torch.isinf(loss):
-        return torch.tensor(1.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
+        print(f"  ⚠ Loss is NaN/Inf")
+        return torch.tensor(0.0, device=pred_logits.device, dtype=pred_logits.dtype, requires_grad=True)
     
     return loss
 
@@ -342,14 +368,14 @@ def combined_loss_multiclass(pred_logits, target, num_classes=16, alpha=0.5):
 # BACKWARD COMPATIBILITY (Binary segmentation)
 # ============================================================================
 
-def create_enhanced_model(in_channels=11, num_classes=16, pretrained=True, device='cpu'):
+def create_enhanced_model(in_channels=11, num_classes=16, pretrained=False, device='cpu'):
     """
     Create enhanced U-Net model.
     
     Args:
         in_channels: Input channels (11 for Sentinel-2 MARIDA)
         num_classes: Output classes (16 for MARIDA: classes 0-15)
-        pretrained: Use pretrained ResNeXt-50
+        pretrained: Use pretrained ResNeXt-50 (False recommended for multi-spectral data)
         device: Device to move model to
     
     Returns:

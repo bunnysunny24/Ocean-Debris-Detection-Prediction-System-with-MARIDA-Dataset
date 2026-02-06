@@ -24,13 +24,14 @@ class ModelConfig:
     MAX_FILTERS = 1024        # Maximum filters at bottleneck
     
     # Training
-    BATCH_SIZE = 12  # Balanced for RTX 4060 8GB with shared memory support
-    LEARNING_RATE = 1e-5  # Reduced from 1e-4 for stability
-    NUM_EPOCHS = 50
+    BATCH_SIZE = 20  # Increased to use shared GPU memory (RTX 4060 8GB + Intel shared 15.8GB available)
+    LEARNING_RATE = 1e-3  # Increased for faster convergence - was 1e-5 which is too small
+    NUM_EPOCHS = 100  # Increased from 50 - allow longer training
     WEIGHT_DECAY = 1e-5
-    LR_SCHEDULER_PATIENCE = 5
+    LR_SCHEDULER_PATIENCE = 15  # Increased patience to allow model to train longer
     USE_MIXED_PRECISION = True  # Enable fp16 mixed precision for faster training
     GRADIENT_CHECKPOINTING = True  # Trade compute for memory (recompute activations)
+    GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients to use more GPU memory efficiently
     
     # Inference
     CONFIDENCE_THRESHOLD = 0.5

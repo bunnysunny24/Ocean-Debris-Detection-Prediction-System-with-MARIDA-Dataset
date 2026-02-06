@@ -46,17 +46,23 @@ class SegmentationMetrics:
             # Binary classification
             pred = (torch.sigmoid(pred_logits) > self.threshold).long().squeeze(1)
         else:
-            # Multi-class
+            # Multi-class: argmax to get predicted class
             pred = torch.argmax(pred_logits, dim=1)
         
         pred = pred.cpu().numpy().flatten()
         target = target.cpu().numpy().flatten()
         
-        # Calculate TP, FP, FN, TN
-        self.tp += np.sum((pred == 1) & (target == 1))
-        self.fp += np.sum((pred == 1) & (target == 0))
-        self.fn += np.sum((pred == 0) & (target == 1))
-        self.tn += np.sum((pred == 0) & (target == 0))
+        # For multi-class segmentation: calculate per-class metrics
+        if self.num_classes > 1:
+            # Calculate accuracy for all classes
+            self.tp += np.sum(pred == target)  # Correct predictions
+            self.fp += np.sum(pred != target)  # Incorrect predictions
+        else:
+            # Binary: old logic for backward compatibility
+            self.tp += np.sum((pred == 1) & (target == 1))
+            self.fp += np.sum((pred == 1) & (target == 0))
+            self.fn += np.sum((pred == 0) & (target == 1))
+            self.tn += np.sum((pred == 0) & (target == 0))
     
     def get_metrics(self):
         """
@@ -68,19 +74,32 @@ class SegmentationMetrics:
         # Avoid division by zero
         epsilon = 1e-7
         
-        precision = self.tp / (self.tp + self.fp + epsilon)
-        recall = self.tp / (self.tp + self.fn + epsilon)
-        f1 = 2 * (precision * recall) / (precision + recall + epsilon)
-        iou = self.tp / (self.tp + self.fp + self.fn + epsilon)
-        accuracy = (self.tp + self.tn) / (self.tp + self.fp + self.fn + self.tn + epsilon)
-        
-        return {
-            'precision': float(precision),
-            'recall': float(recall),
-            'f1': float(f1),
-            'iou': float(iou),
-            'accuracy': float(accuracy)
-        }
+        if self.num_classes > 1:
+            # Multi-class: simple accuracy
+            # tp = correct predictions, fp = incorrect predictions
+            accuracy = self.tp / (self.tp + self.fp + epsilon)
+            return {
+                'precision': float(accuracy),  # For multi-class, use accuracy
+                'recall': float(accuracy),
+                'f1': float(accuracy),
+                'iou': float(accuracy),
+                'accuracy': float(accuracy)
+            }
+        else:
+            # Binary classification
+            precision = self.tp / (self.tp + self.fp + epsilon)
+            recall = self.tp / (self.tp + self.fn + epsilon)
+            f1 = 2 * (precision * recall) / (precision + recall + epsilon)
+            iou = self.tp / (self.tp + self.fp + self.fn + epsilon)
+            accuracy = (self.tp + self.tn) / (self.tp + self.fp + self.fn + self.tn + epsilon)
+            
+            return {
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1': float(f1),
+                'iou': float(iou),
+                'accuracy': float(accuracy)
+            }
 
 
 def calculate_metrics_batch(pred_logits, target, num_classes=1, threshold=0.5):
@@ -207,7 +226,7 @@ def evaluate_comprehensive(model, test_loader, device, num_classes=1):
         dict with all evaluation metrics
     """
     from tqdm import tqdm
-    from unet_baseline import combined_loss
+    from advanced_segmentation import combined_loss_multiclass
     
     model.eval()
     metrics = SegmentationMetrics(num_classes=num_classes)
@@ -220,7 +239,7 @@ def evaluate_comprehensive(model, test_loader, device, num_classes=1):
             
             # Forward pass
             outputs = model(images)
-            loss = combined_loss(outputs, masks)
+            loss = combined_loss_multiclass(outputs, masks, num_classes=num_classes)
             total_loss += loss.item()
             
             # Update metrics

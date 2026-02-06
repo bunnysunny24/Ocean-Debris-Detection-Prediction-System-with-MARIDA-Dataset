@@ -820,9 +820,9 @@ This project is for research and environmental monitoring purposes.
 ```bibtex
 @software{ocean_debris_marida_2026,
   title={Ocean Debris Detection & Prediction System with MARIDA Dataset},
-  author={bhavashesh, Renuka},
+  author={AI-Assisted Development},
   year={2026},
-  url={https://github.com/bunnysunny24/ocean-debris-detection}
+  url={https://github.com/yourusername/ocean-debris-detection}
 }
 ```
 
@@ -936,4 +936,3 @@ python test_data_loading.py
 **Status**: 🟢 **PRODUCTION READY - ALL SYSTEMS GO**
 
 Ready to begin training when you are!
-

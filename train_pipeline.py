@@ -21,7 +21,7 @@ from drift_simulator import DriftSimulator, OceanCurrentData, WindData, Trajecto
 from postprocess_results import MaskRefiner, Polygonizer, export_results
 
 
-def train_epoch(model, train_loader, optimizer, device):
+def train_epoch(model, train_loader, optimizer, device, epoch=None, total_epochs=None):
     """
     Train for one epoch.
     
@@ -33,7 +33,13 @@ def train_epoch(model, train_loader, optimizer, device):
     batch_count = 0
     skip_count = 0
     
-    with tqdm(train_loader, desc="Training", leave=False) as pbar:
+    # Create description with epoch info
+    if epoch is not None and total_epochs is not None:
+        desc = f"Epoch {epoch:3d}/{total_epochs} - Training"
+    else:
+        desc = "Training"
+    
+    with tqdm(train_loader, desc=desc, leave=False) as pbar:
         for images, masks in pbar:
             images = images.to(device).float()  # Ensure float type
             masks = masks.to(device).long()     # Ensure long type for class labels
@@ -85,6 +91,7 @@ def validate_epoch(model, val_loader, device):
     model.eval()  # Explicitly set to eval mode
     total_loss = 0.0
     batch_count = 0
+    fallback_count = 0
     
     with torch.no_grad():
         with tqdm(val_loader, desc="Validation", leave=False) as pbar:
@@ -92,9 +99,18 @@ def validate_epoch(model, val_loader, device):
                 images = images.to(device).float()  # Ensure float type
                 masks = masks.to(device).long()     # Ensure long type for class labels
                 
+                # Validate class indices
+                if masks.min() < 0 or masks.max() >= 16:
+                    print(f"  ⚠ Invalid mask indices: min={masks.min()}, max={masks.max()}")
+                    fallback_count += 1
+                
                 outputs = model(images)
                 # Use multi-class loss for MARIDA dataset (16 classes)
                 loss = combined_loss_multiclass(outputs, masks)
+                
+                # Track if fallback (loss == 1.0) is being triggered
+                if loss.item() == 1.0:
+                    fallback_count += 1
                 
                 # Skip NaN losses
                 if not torch.isnan(loss) and not torch.isinf(loss):
@@ -106,7 +122,11 @@ def validate_epoch(model, val_loader, device):
     
     if batch_count == 0:
         return float('nan')
-    return total_loss / batch_count
+    
+    avg_loss = total_loss / batch_count
+    if fallback_count > 0:
+        print(f"  ⚠ {fallback_count} batches used fallback loss (1.0)")
+    return avg_loss
 
 
 def train_model_advanced(model, train_loader, val_loader, device, epochs=50, 
@@ -143,7 +163,7 @@ def train_model_advanced(model, train_loader, val_loader, device, epochs=50,
     
     for epoch in range(1, epochs + 1):
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        train_loss = train_epoch(model, train_loader, optimizer, device, epoch, epochs)
         
         # Validate
         val_loss = validate_epoch(model, val_loader, device)
@@ -215,7 +235,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, model_save_p
     
     for epoch in range(1, epochs + 1):
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        train_loss = train_epoch(model, train_loader, optimizer, device, epoch, epochs)
         
         # Validate
         val_loss = validate_epoch(model, val_loader, device)
@@ -393,7 +413,7 @@ def main():
     print(f"\n[STEP 4/5] EVALUATING MODEL")
     print(f"{'-'*70}")
     
-    metrics = evaluate_comprehensive(model_enhanced, test_loader, device, num_classes=4)
+    metrics = evaluate_comprehensive(model_enhanced, test_loader, device, num_classes=16)
     save_metrics(metrics, filepath=os.path.join(results_dir, 'evaluation_metrics.json'))
     
     # ========================================================================
