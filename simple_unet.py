@@ -11,13 +11,14 @@ import torch.nn.functional as F
 
 class SimpleUNet(nn.Module):
     """
-    Minimal U-Net: NO batch norm, NO attention, ultra-stable.
+    Balanced U-Net: 4 encoding levels (proven to work) + light dropout for stability.
+    Deep enough to learn patterns, simple enough to generalize.
     """
     
     def __init__(self, in_channels=11, num_classes=16):
         super(SimpleUNet, self).__init__()
         
-        # Encoder - no batch norm
+        # Encoder - 4 levels (BALANCED)
         self.enc1 = self._conv_block(in_channels, 32)      # 256 -> 256
         self.pool1 = nn.MaxPool2d(2, 2)                     # 256 -> 128
         
@@ -33,7 +34,7 @@ class SimpleUNet(nn.Module):
         # Bottleneck
         self.bottleneck = self._conv_block(256, 512)        # 16 -> 16
         
-        # Decoder
+        # Decoder - 4 levels back
         self.upconv4 = nn.ConvTranspose2d(512, 256, 2, 2)  # 16 -> 32
         self.dec4 = self._conv_block(512, 256)              # 32 -> 32
         
@@ -53,19 +54,20 @@ class SimpleUNet(nn.Module):
         self._init_weights()
     
     def _conv_block(self, in_ch, out_ch):
-        """Conv block WITHOUT batch norm for maximum stability."""
+        """Conv block with LIGHT dropout (0.15) for stability without killing learning."""
         return nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=True),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.15),  # LIGHT dropout - won't block learning
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.15)   # LIGHT dropout
         )
     
     def _init_weights(self):
         """Initialize weights conservatively."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Use smaller initialization to prevent explosions
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
@@ -112,8 +114,6 @@ class SimpleUNet(nn.Module):
         out = self.out(x)          # num_classes
         
         # CRITICAL: Clamp logits to prevent softmax overflow/underflow
-        # Without clamping, exp(logits) overflows for |logits| > ~88
-        # And causes infinite/NaN gradients during backprop
         out = torch.clamp(out, -10.0, 10.0)
         
         return out
@@ -210,16 +210,19 @@ def simple_cross_entropy_loss(pred_logits, target, num_classes=16, class_weights
 
 def focal_loss(pred_logits, target, num_classes=16, alpha=None, gamma=2.0):
     """
-    Focal Loss for handling severe class imbalance.
-    Focuses training on hard negative examples (misclassified samples).
-    Formula: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    Focal Loss for extreme class imbalance.
+    Applied to ALL pixels so model properly learns minority classes.
+    
+    Formula: FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+    - Gamma=2.0 gives ~100x more weight to hard examples vs easy ones
+    - Class weights: Background 0.01x, Minorities 3.0x guide gradient toward rare classes
     
     Args:
         pred_logits: (B, C, H, W) - model output 
         target: (B, H, W) - ground truth labels (0-15)
         num_classes: number of classes
-        alpha: (num_classes,) - per-class weighting [default: computed from batch]
-        gamma: focusing parameter (higher = more focus on hard examples, typical 2.0)
+        alpha: per-class weighting
+        gamma: focusing parameter
     
     Returns:
         scalar focal loss
@@ -228,43 +231,47 @@ def focal_loss(pred_logits, target, num_classes=16, alpha=None, gamma=2.0):
     pred_logits = torch.clamp(pred_logits, -10.0, 10.0)
     target = target.long()
     
-    # If alpha not provided, compute from batch class frequencies
-    # This gives automatic downweighting to majority class (background)
-    if alpha is None:
-        # Count class occurrences in this batch
-        class_counts = torch.bincount(target.reshape(-1), minlength=num_classes).float()
-        # Inverse frequency weighting: rarer classes get higher weight
-        # Use sqrt to make it less extreme
-        alpha = 1.0 / torch.sqrt(class_counts + 1e-6)
-        # Normalize to mean = 1.0
-        alpha = alpha / alpha.mean()
-        alpha = alpha.to(pred_logits.device)
-    
-    # Get softmax probabilities
+    # Get softmax probabilities for ALL pixels (not hard-mined)
     p = F.softmax(pred_logits, dim=1)  # (B, C, H, W)
-    
-    # Get log probabilities
     log_p = F.log_softmax(pred_logits, dim=1)  # (B, C, H, W)
     
-    # Reshape for easier indexing
-    p_flat = p.permute(0, 2, 3, 1).reshape(-1, num_classes)  # (B*H*W, C)
-    log_p_flat = log_p.permute(0, 2, 3, 1).reshape(-1, num_classes)  # (B*H*W, C)
-    target_flat = target.reshape(-1)  # (B*H*W,)
+    # Flatten for easier computation
+    B, C, H, W = pred_logits.shape
+    p_flat = p.view(B * H * W, C)  # (B*H*W, C)
+    log_p_flat = log_p.view(B * H * W, C)  # (B*H*W, C)
+    target_flat = target.view(B * H * W)  # (B*H*W,)
     
-    # Get probability of true class
+    # Get probability of true class for each pixel
     p_t = p_flat.gather(1, target_flat.unsqueeze(1)).squeeze(1)  # (B*H*W,)
     log_p_t = log_p_flat.gather(1, target_flat.unsqueeze(1)).squeeze(1)  # (B*H*W,)
     
-    # Compute focal loss: (1 - p_t)^gamma * -log(p_t)
-    focal_weight = (1 - p_t) ** gamma
-    focal_loss_val = -focal_weight * log_p_t
+    # Focal weight: (1 - p_t)^gamma
+    # - Easy examples (p_t ≈ 1.0): focal_weight ≈ 0 (down-weighted)
+    # - Hard examples (p_t ≈ 0.0): focal_weight ≈ 1.0 (full weight)
+    focal_weight = (1 - p_t) ** gamma  # (B*H*W,)
     
-    # Apply alpha (class weighting)
-    alpha_t = alpha.gather(0, target_flat)
-    focal_loss_val = focal_loss_val * alpha_t
+    # Base focal loss
+    focal_loss_val = -focal_weight * log_p_t  # (B*H*W,)
     
-    # Return mean loss
-    loss = focal_loss_val.mean()
+    # Apply BALANCED AGGRESSIVE class weighting
+    if alpha is None:
+        # Smart weighting that forces learning without breaking the network:
+        # Background: 0.001 (strongly downweight - it's 99% of data anyway)
+        # ALL minorities: 1.0 (equal importance, let focal loss do the hard work)
+        # KEY: Focal loss with gamma=2.0 already gives minorities ~100x more weight for hard pixels
+        # Adding extreme class weight on top breaks optimization
+        class_weight = torch.ones(num_classes, device=pred_logits.device)
+        class_weight[0] = 0.001  # Background: 0.1% weight (heavily downweight)
+        for i in range(1, num_classes):
+            class_weight[i] = 1.0  # Minorities: equal weight (let focal loss amplify)
+        alpha = class_weight
+    
+    # Apply class weights
+    alpha_t = alpha.gather(0, target_flat)  # (B*H*W,)
+    focal_loss_weighted = focal_loss_val * alpha_t
+    
+    # Return mean loss over all pixels
+    loss = focal_loss_weighted.mean()
     
     # Check for NaN
     if torch.isnan(loss):

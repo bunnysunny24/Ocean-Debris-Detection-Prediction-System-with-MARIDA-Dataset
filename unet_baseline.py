@@ -27,7 +27,7 @@ class ModelConfig:
     BATCH_SIZE = 20           # Proven stable batch size
     LEARNING_RATE = 0.0001    # Standard learning rate
     NUM_EPOCHS = 50           # 50 epochs with early stopping
-    WEIGHT_DECAY = 1e-5       # L2 regularization
+    WEIGHT_DECAY = 5e-4       # L2 regularization - balanced (not too strong to kill learning)
     LR_SCHEDULER_PATIENCE = 10 # ReduceLROnPlateau patience
     
     # Inference

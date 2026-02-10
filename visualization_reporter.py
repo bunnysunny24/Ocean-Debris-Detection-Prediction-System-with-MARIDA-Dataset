@@ -89,51 +89,35 @@ class TrainingVisualizer:
         return cm
     
     def plot_auc_curves(self, y_true, y_pred_proba, epoch, class_names=None):
-        """Generate AUC-ROC curves for each class and micro/macro average"""
-        # Binarize labels
+        """Generate single overall AUC-ROC curve (micro-averaged) for the epoch"""
+        # Binarize labels for micro-averaging
         y_true_bin = label_binarize(y_true, classes=list(range(self.num_classes)))
         
-        fig, axes = plt.subplots(4, 4, figsize=(20, 18))
-        axes = axes.flatten()
+        # Compute micro-averaged ROC curve
+        fpr_micro, tpr_micro, _ = roc_curve(y_true_bin.ravel(), y_pred_proba.ravel())
+        roc_auc_micro = auc(fpr_micro, tpr_micro)
         
-        fpr_micro = None
-        tpr_micro = None
-        roc_auc_micro = None
+        # Create single figure with overall AUC curve
+        fig, ax = plt.subplots(figsize=(10, 8))
         
-        for i in range(self.num_classes):
-            ax = axes[i]
-            
-            try:
-                # One-vs-rest for this class
-                fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_proba[:, i])
-                roc_auc = auc(fpr, tpr)
-                
-                ax.plot(fpr, tpr, color='darkorange', lw=2, 
-                       label=f'AUC = {roc_auc:.3f}')
-                ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
-                
-                class_name = class_names[i] if class_names else f'Class {i}'
-                ax.set_title(f'{class_name} (Class {i})', fontweight='bold', fontsize=11)
-                ax.set_xlabel('False Positive Rate', fontsize=10)
-                ax.set_ylabel('True Positive Rate', fontsize=10)
-                ax.legend(loc='lower right', fontsize=9)
-                ax.grid(True, alpha=0.3)
-                
-                if i == 0:
-                    fpr_micro, tpr_micro = fpr, tpr
-                    roc_auc_micro = roc_auc
-            except Exception as e:
-                ax.text(0.5, 0.5, f'Error: {str(e)[:30]}', ha='center', va='center')
-                ax.set_title(f'Class {i}', fontweight='bold')
+        # Plot micro-averaged ROC curve
+        ax.plot(fpr_micro, tpr_micro, color='darkorange', lw=3, 
+               label=f'Micro-Averaged AUC = {roc_auc_micro:.4f}')
         
-        # Remove empty subplots
-        for i in range(self.num_classes, len(axes)):
-            fig.delaxes(axes[i])
+        # Plot random classifier line
+        ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+               label='Random Classifier (AUC = 0.5000)')
         
-        fig.suptitle(f'Epoch {epoch}: ROC Curves for All Classes', 
-                    fontsize=16, fontweight='bold', y=0.995)
+        ax.set_xlabel('False Positive Rate', fontsize=12, fontweight='bold')
+        ax.set_ylabel('True Positive Rate', fontsize=12, fontweight='bold')
+        ax.set_title(f'Epoch {epoch}: Overall ROC Curve (Micro-Averaged)', 
+                    fontsize=14, fontweight='bold')
+        ax.legend(loc='lower right', fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        
         plt.tight_layout()
-        
         save_path = self.output_dir / 'auc_curves' / f'epoch_{epoch:03d}_auc.png'
         plt.savefig(save_path, dpi=100, bbox_inches='tight')
         plt.close()

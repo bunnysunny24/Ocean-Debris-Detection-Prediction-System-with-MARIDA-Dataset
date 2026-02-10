@@ -17,6 +17,7 @@ from unet_baseline import ModelConfig, get_optimizer, get_scheduler
 from simple_unet import create_simple_model, simple_cross_entropy_loss, focal_loss, calculate_class_weights
 from augment_data import AugmentedDebrisDataset
 from balanced_sampler import BalancedPatchSampler
+from stratified_sampler import create_stratified_batches
 from metrics_tracker import MetricsTracker, MARIDA_CLASSES, get_confusion_matrix_summary
 from visualization_reporter import TrainingVisualizer
 from eval_metrics import evaluate_comprehensive, save_metrics
@@ -250,10 +251,12 @@ def train_model_advanced(model, train_loader, val_loader, device, epochs=50,
         else:
             patience_counter += 1
         
-        # Early stopping (with Focal Loss, need much higher patience to allow learning)
-        # Patience = 50 epochs (focal loss needs time to learn minority classes)
-        if patience_counter >= 50:
-            print(f"\n⚠ Early stopping triggered (patience: {patience_counter}/50)")
+        # Early stopping (VERY HIGH patience for learning rare classes with hard mining focal loss)
+        # Epoch 1-20: Initial learning, expect val loss to fluctuate
+        # Epoch 20-40: Focal loss focuses on minority classes, gradual improvement
+        # Epoch 40+: Fine-tuning, model should be detecting rare classes
+        if patience_counter >= 150:  # INCREASE: Allow 150 epochs of no improvement (deep learning takes time)
+            print(f"\n⚠ Early stopping triggered (patience: {patience_counter}/150)")
             break
     
     # Load best model if it exists
@@ -503,28 +506,19 @@ def main():
             p_aug=0.7  # 70% augmentation probability
         )
         
-        # Create augmented training loader with BALANCED SAMPLING
-        # Ensures patches with Marine Debris, Sargassum, Ships get prioritized
-        balanced_sampler = BalancedPatchSampler(
-            dataset=augmented_dataset,
-            num_samples=len(augmented_dataset),
-            dataset_dir='Dataset'
-        )
-        
-        train_loader = torch.utils.data.DataLoader(
+        # Create augmented training loader with STRATIFIED BATCH SAMPLING
+        # Each batch guaranteed to have diverse class representation
+        # Ensures model SEES Marine Debris, Ships, Sargassum, etc. every batch
+        print(f"\n  🎲 Creating stratified batches for guaranteed class diversity...")
+        train_loader = create_stratified_batches(
             augmented_dataset,
-            batch_size=ModelConfig.BATCH_SIZE,
-            sampler=balanced_sampler,  # Use balanced sampler instead of shuffle
-            num_workers=0
+            batch_size=ModelConfig.BATCH_SIZE
         )
         
-        print(f"✓ MARIDA dataset loaded with augmentation + BALANCED PATCH SAMPLING")
-        print(f"  Train: {len(augmented_dataset)} samples (with augmentation + balanced sampling)")
+        print(f"✓ MARIDA dataset loaded with augmentation + STRATIFIED BATCHING")
+        print(f"  Train: {len(augmented_dataset)} samples (every batch has diverse classes)")
         print(f"  Val: {len(val_loader.dataset)} samples")
         print(f"  Test: {len(test_loader.dataset)} samples")
-        
-        # Calculate SIMPLE class weights based on dataset split
-        # (not from full dataloader to avoid index issues)
         print(f"  ✓ Using Focal Loss with alpha weighting for extreme class imbalance")
         class_weights = None  # Will compute manually in training
     except Exception as e:
@@ -536,21 +530,12 @@ def main():
         )
         print(f"✓ Loaded with basic loading (no augmentation)")
         
-        # Still use balanced sampler on fallback loader
-        balanced_sampler = BalancedPatchSampler(
-            dataset=train_loader_base.dataset,
-            num_samples=len(train_loader_base.dataset),
-            dataset_dir='Dataset'
-        )
-        
-        train_loader = torch.utils.data.DataLoader(
+        # Still use stratified sampling on fallback loader
+        train_loader = create_stratified_batches(
             train_loader_base.dataset,
-            batch_size=ModelConfig.BATCH_SIZE,
-            sampler=balanced_sampler,
-            num_workers=0
+            batch_size=ModelConfig.BATCH_SIZE
         )
-        print(f"✓ Applied BALANCED PATCH SAMPLING to fallback loader")
-        print(f"  ✓ Using Focal Loss with alpha weighting for extreme class imbalance")
+        print(f"✓ Applied STRATIFIED BATCH SAMPLING to fallback loader")
         class_weights = None  # Will compute manually in training
     
     # ========================================================================
@@ -574,7 +559,7 @@ def main():
         train_loader,
         val_loader,
         device,
-        epochs=ModelConfig.NUM_EPOCHS,
+        epochs=200,  # INCREASE: Train much longer to deeply learn minorities
         model_save_path=enhanced_model_path,
         use_multiclass=True,
         class_weights=class_weights
