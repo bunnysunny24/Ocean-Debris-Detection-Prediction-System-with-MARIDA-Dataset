@@ -348,8 +348,8 @@ def export_results(predictions: np.ndarray, image: np.ndarray,
     
     # Save as GeoJSON
     geojson = Polygonizer.mask_to_geojson(refined_mask)
-    with open(os.path.join(output_dir, 'detections.geojson'), 'w') as f:
-        json.dump(geojson, f, indent=2)
+    with open(os.path.join(output_dir, 'detections.geojson'), 'w', encoding='utf-8') as f:
+        json.dump(geojson, f, indent=2, ensure_ascii=False)
     
     # Create visualization
     if image.shape[0] == 3 or image.shape[2] == 3:

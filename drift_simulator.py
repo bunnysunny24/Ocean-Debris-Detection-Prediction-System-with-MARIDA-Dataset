@@ -4,8 +4,10 @@ Ocean current and wind-based debris drift prediction using Parcels-like integrat
 """
 
 import numpy as np
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import json
+import os
+from pathlib import Path
 
 
 # ============================================================================
@@ -98,8 +100,139 @@ class WindData:
 
 
 # ============================================================================
-# DRIFT SIMULATION ENGINE
+# DATA LOADING FUNCTIONS
 # ============================================================================
+
+def load_ocean_and_wind_data(cmems_file: Optional[str] = None, 
+                             era5_file: Optional[str] = None,
+                             depth_level: int = 0) -> Tuple[OceanCurrentData, WindData]:
+    """
+    Load real CMEMS ocean current and ERA5 wind data from NetCDF files.
+    If files don't exist, returns synthetic data objects.
+    
+    Args:
+        cmems_file: Path to CMEMS NetCDF file
+        era5_file: Path to ERA5 NetCDF file
+        depth_level: Which depth level to extract (default: surface = 0)
+    
+    Returns:
+        (OceanCurrentData, WindData) tuple
+    """
+    ocean_currents = None
+    wind_data = None
+    
+    # Try to load CMEMS data
+    if cmems_file and os.path.exists(cmems_file):
+        try:
+            import xarray as xr
+            print(f"Loading CMEMS ocean current data from {cmems_file}...")
+            
+            ds = xr.open_dataset(cmems_file)
+            
+            # Extract variables (handle different naming conventions)
+            u_var = 'uo' if 'uo' in ds else 'u' if 'u' in ds else None
+            v_var = 'vo' if 'vo' in ds else 'v' if 'v' in ds else None
+            
+            if u_var and v_var:
+                # Get surface level data
+                u_data = ds[u_var].isel(depth=depth_level).values if 'depth' in ds[u_var].dims else ds[u_var].values
+                v_data = ds[v_var].isel(depth=depth_level).values if 'depth' in ds[v_var].dims else ds[v_var].values
+                
+                lat_grid = ds['latitude'].values if 'latitude' in ds else ds['lat'].values
+                lon_grid = ds['longitude'].values if 'longitude' in ds else ds['lon'].values
+                time_grid = ds['time'].values if 'time' in ds else np.arange(u_data.shape[0])
+                
+                ocean_currents = OceanCurrentData(u_data, v_data, lat_grid, lon_grid, time_grid)
+                print(f"  ✓ Loaded CMEMS data: shape {u_data.shape}")
+            else:
+                print(f"  ⚠ Could not find velocity variables in {cmems_file}")
+            
+            ds.close()
+        except ImportError:
+            print(f"  ⚠ xarray not installed. Install with: pip install xarray")
+        except Exception as e:
+            print(f"  ⚠ Error loading CMEMS data: {e}")
+    else:
+        if cmems_file:
+            print(f"  ℹ CMEMS file not found: {cmems_file}")
+    
+    # Try to load ERA5 data
+    if era5_file and os.path.exists(era5_file):
+        try:
+            import xarray as xr
+            print(f"Loading ERA5 wind data from {era5_file}...")
+            
+            ds = xr.open_dataset(era5_file)
+            
+            # Extract variables (handle different naming conventions)
+            u10_var = 'u10m' if 'u10m' in ds else 'u10' if 'u10' in ds else None
+            v10_var = 'v10m' if 'v10m' in ds else 'v10' if 'v10' in ds else None
+            
+            if u10_var and v10_var:
+                u10_data = ds[u10_var].values
+                v10_data = ds[v10_var].values
+                
+                lat_grid = ds['latitude'].values if 'latitude' in ds else ds['lat'].values
+                lon_grid = ds['longitude'].values if 'longitude' in ds else ds['lon'].values
+                time_grid = ds['time'].values if 'time' in ds else np.arange(u10_data.shape[0])
+                
+                wind_data = WindData(u10_data, v10_data, lat_grid, lon_grid, time_grid)
+                print(f"  ✓ Loaded ERA5 data: shape {u10_data.shape}")
+            else:
+                print(f"  ⚠ Could not find wind variables in {era5_file}")
+            
+            ds.close()
+        except ImportError:
+            print(f"  ⚠ xarray not installed. Install with: pip install xarray")
+        except Exception as e:
+            print(f"  ⚠ Error loading ERA5 data: {e}")
+    else:
+        if era5_file:
+            print(f"  ℹ ERA5 file not found: {era5_file}")
+    
+    # If no real data loaded, return empty objects (will use synthetic data)
+    if ocean_currents is None:
+        print(f"  ℹ Using synthetic ocean current data")
+        ocean_currents = OceanCurrentData()
+    
+    if wind_data is None:
+        print(f"  ℹ Using synthetic wind data")
+        wind_data = WindData()
+    
+    return ocean_currents, wind_data
+
+
+def auto_load_ocean_and_wind_data(data_dir: str = 'data') -> Tuple[OceanCurrentData, WindData]:
+    """
+    Automatically find and load CMEMS and ERA5 files from data directory.
+    
+    Looks for:
+    - CMEMS_currents_*.nc
+    - ERA5_wind_*.nc
+    
+    Args:
+        data_dir: Directory to search for data files
+    
+    Returns:
+        (OceanCurrentData, WindData) tuple
+    """
+    cmems_file = None
+    era5_file = None
+    
+    if os.path.exists(data_dir):
+        files = list(Path(data_dir).glob('*.nc'))
+        
+        for f in files:
+            if 'CMEMS' in f.name or 'cmems' in f.name:
+                cmems_file = str(f)
+                print(f"Found CMEMS file: {cmems_file}")
+            elif 'ERA5' in f.name or 'era5' in f.name:
+                era5_file = str(f)
+                print(f"Found ERA5 file: {era5_file}")
+    
+    return load_ocean_and_wind_data(cmems_file, era5_file)
+
+
 
 class DebrisParticle:
     """Single debris particle for Lagrangian tracking."""
@@ -334,8 +467,8 @@ class TrajectoryAnalyzer:
             'features': features
         }
         
-        with open(filepath, 'w') as f:
-            json.dump(geojson, f, indent=2)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(geojson, f, indent=2, ensure_ascii=False)
         
         print(f"✓ Exported {len(particles)} trajectories to {filepath}")
 

@@ -13,25 +13,22 @@ import torch.nn.functional as F
 # ============================================================================
 
 class ModelConfig:
-    """Configuration for U-Net model"""
+    """Configuration for ResNet-50 + CBAM 16-class model"""
     
     # Input/Output
-    IN_CHANNELS = 6           # Sentinel-2 bands: B2, B3, B4, B8, B11, B12
-    OUT_CHANNELS = 1          # Binary segmentation: debris / no debris
+    IN_CHANNELS = 11          # All Sentinel-2 bands (B1-B12 except B10)
+    OUT_CHANNELS = 16         # 16-class MARIDA segmentation
     
     # Architecture
-    INITIAL_FILTERS = 64      # Starting number of filters
-    MAX_FILTERS = 1024        # Maximum filters at bottleneck
+    INITIAL_FILTERS = 64      # Starting number of filters for ResNet
+    MAX_FILTERS = 2048        # ResNet-50 max filters at bottleneck
     
-    # Training
-    BATCH_SIZE = 20  # Increased to use shared GPU memory (RTX 4060 8GB + Intel shared 15.8GB available)
-    LEARNING_RATE = 1e-3  # Increased for faster convergence - was 1e-5 which is too small
-    NUM_EPOCHS = 100  # Increased from 50 - allow longer training
-    WEIGHT_DECAY = 1e-5
-    LR_SCHEDULER_PATIENCE = 15  # Increased patience to allow model to train longer
-    USE_MIXED_PRECISION = True  # Enable fp16 mixed precision for faster training
-    GRADIENT_CHECKPOINTING = True  # Trade compute for memory (recompute activations)
-    GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients to use more GPU memory efficiently
+    # Training - STABLE SETTINGS FOR SIMPLEUNET
+    BATCH_SIZE = 20           # Proven stable batch size
+    LEARNING_RATE = 0.0001    # Standard learning rate
+    NUM_EPOCHS = 50           # 50 epochs with early stopping
+    WEIGHT_DECAY = 1e-5       # L2 regularization
+    LR_SCHEDULER_PATIENCE = 10 # ReduceLROnPlateau patience
     
     # Inference
     CONFIDENCE_THRESHOLD = 0.5

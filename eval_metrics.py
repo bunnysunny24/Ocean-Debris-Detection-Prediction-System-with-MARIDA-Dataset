@@ -262,8 +262,8 @@ def save_metrics(metrics, filepath='evaluation_metrics.json'):
         metrics: dict with metrics
         filepath: Path to save JSON
     """
-    with open(filepath, 'w') as f:
-        json.dump(metrics, f, indent=2)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
     
     print(f"\n✓ Metrics saved to {filepath}")
     
