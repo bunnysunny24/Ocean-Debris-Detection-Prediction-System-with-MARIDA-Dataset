@@ -197,8 +197,39 @@ class MARIDADataset(Dataset):
         if not os.path.exists(split_file):
             raise FileNotFoundError(f"Split file not found: {split_file}")
 
+
         with open(split_file) as f:
-            self.patch_ids = [l.strip() for l in f if l.strip()]
+            patch_ids = [l.strip() for l in f if l.strip()]
+
+        # Aggressive oversampling: duplicate debris-rich patches
+        if split == "train":
+            debris_patches = []
+            normal_patches = []
+            hard_negatives = []
+            for pid in patch_ids:
+                mask_tif = _find_mask_tif(pid)
+                tif = _find_tif(pid)
+                is_debris = False
+                is_hard_negative = False
+                if mask_tif:
+                    with rasterio.open(mask_tif) as src:
+                        mask = src.read(1).astype(np.int64) - 1
+                    if (mask == 0).sum() > 10:
+                        debris_patches.extend([pid]*5)
+                        is_debris = True
+                if not is_debris and tif:
+                    with rasterio.open(tif) as src:
+                        img = src.read(list(range(1, INPUT_BANDS + 1))).astype(np.float32)
+                    img_norm = normalise(img)
+                    # Hard negative: bright or high-variance patches (likely confused with debris)
+                    if img_norm.mean() > 0.6 or img_norm.std() > 0.25:
+                        hard_negatives.extend([pid]*3)
+                        is_hard_negative = True
+                if not is_debris and not is_hard_negative:
+                    normal_patches.append(pid)
+            self.patch_ids = debris_patches + hard_negatives + normal_patches
+        else:
+            self.patch_ids = patch_ids
 
         # Compute normalisation stats from training split on first call
         global _STATS_COMPUTED
@@ -229,8 +260,20 @@ class MARIDADataset(Dataset):
         else:
             mask = np.zeros((img.shape[1], img.shape[2]), dtype=np.int64)
 
-        # Convert DN [1-15] → index [0-14]; nodata (0) → -1 (ignored in loss)
-        mask = mask - 1   # now [0-14], nodata = -1
+        # Convert DN [1-15] → binary: debris=0, not-debris=1; nodata (0) → -1
+        mask = mask - 1   # [0-14], nodata= -1
+        debris_mask = (mask == 0)
+        not_debris_mask = (mask >= 1) & (mask <= 14)
+        mask_bin = np.full_like(mask, fill_value=1, dtype=np.int64)  # default not-debris
+        mask_bin[debris_mask] = 0
+        mask_bin[mask == -1] = -1
+        mask = mask_bin
+        # Filter out patches with too few pixels of either class
+        debris_count = np.sum(mask == 0)
+        not_debris_count = np.sum(mask == 1)
+        if debris_count < 10 or not_debris_count < 10:
+            # Return None or skip this patch
+            return self.__getitem__((idx + 1) % len(self.patch_ids))
 
         # ── Load confidence ──
         conf = np.ones_like(mask, dtype=np.float32)
@@ -246,9 +289,16 @@ class MARIDADataset(Dataset):
         # ── Normalise ──
         img = normalise(img)
 
+
         # ── Augment ──
         if self.augment_data:
-            img, mask = augment(img, mask)
+            # Strongest augmentation for debris patches
+            if (mask == 0).sum() > 0:
+                for _ in range(5):
+                    img, mask = augment(img, mask)
+            else:
+                for _ in range(2):
+                    img, mask = augment(img, mask)
 
         img  = torch.from_numpy(img).float()
         mask = torch.from_numpy(mask).long()
