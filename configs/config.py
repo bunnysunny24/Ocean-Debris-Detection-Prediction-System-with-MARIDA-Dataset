@@ -22,53 +22,26 @@ os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ─────────────────────────── DATASET ─────────────────────────
-NUM_CLASSES   = 15          # MARIDA semantic classes (DN 1-15)
+NUM_CLASSES   = 2           # Binary: debris vs. not-debris
 INPUT_BANDS   = 11          # Sentinel-2 bands (B10 excluded)
 PATCH_SIZE    = 256
 
 CLASS_NAMES = {
-    1:  "Marine Debris",
-    2:  "Dense Sargassum",
-    3:  "Sparse Sargassum",
-    4:  "Natural Organic Material",
-    5:  "Ship",
-    6:  "Clouds",
-    7:  "Marine Water",
-    8:  "Sediment-Laden Water",
-    9:  "Foam",
-    10: "Turbid Water",
-    11: "Shallow Water",
-    12: "Waves",
-    13: "Cloud Shadows",
-    14: "Wakes",
-    15: "Mixed Water",
+    0: "Debris",
+    1: "Not Debris",
 }
 
 # Class weights (inverse frequency – tune after spectral extraction)
-CLASS_WEIGHTS = [
-    10.0,  # Marine Debris  (rare)
-    3.0,   # Dense Sargassum
-    3.0,   # Sparse Sargassum
-    4.0,   # Natural Organic Material
-    5.0,   # Ship
-    1.5,   # Clouds
-    0.5,   # Marine Water   (dominant)
-    2.0,   # Sediment-Laden Water
-    4.0,   # Foam
-    2.0,   # Turbid Water
-    2.0,   # Shallow Water
-    2.5,   # Waves
-    2.0,   # Cloud Shadows
-    3.0,   # Wakes
-    1.5,   # Mixed Water
-]
+CLASS_WEIGHTS = [1.0, 1.0]  # Debris (rare), Not Debris
 
 # ─────────────────────────── TRAINING ────────────────────────
-BATCH_SIZE   = 8
+
+BATCH_SIZE   = 16
 EPOCHS       = 100
 LR           = 1e-4
 WEIGHT_DECAY = 1e-5
 PATIENCE     = 15           # early-stopping patience
+NUM_WORKERS  = 24           # Use all 24 CPU cores for DataLoader
 
 # ─────────────────────────── AUGMENTATION ────────────────────
 AUG_PROB          = 0.5
@@ -78,7 +51,7 @@ SPECTRAL_NOISE    = 0.02
 BRIGHTNESS_RANGE  = (-0.1, 0.1)
 
 # ─────────────────────────── POST-PROCESSING ─────────────────
-MIN_DEBRIS_PIXELS = 50      # remove blobs smaller than this
+MIN_DEBRIS_PIXELS = 200     # remove blobs smaller than this (stricter)
 
 # ─────────────────────────── DRIFT ───────────────────────────
 DRIFT_HOURS       = 72      # total prediction horizon
