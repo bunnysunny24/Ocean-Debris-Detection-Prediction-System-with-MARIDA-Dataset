@@ -16,7 +16,13 @@ Usage:
     python run_pipeline.py --ocean_nc cmems.nc --wind_nc era5.nc  # real current fields
 """
 
+
 import os, sys, argparse, subprocess
+from configs.config import (
+    BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, PATIENCE, NUM_WORKERS,
+    CHECKPOINTS_DIR, LOGS_DIR, OUTPUTS_DIR, PATCHES_DIR, SPLITS_DIR,
+    H5_PATH, H5_SI_PATH, H5_GLCM_PATH, MIN_DEBRIS_PIXELS
+)
 
 BASE = os.path.dirname(__file__)
 
@@ -65,6 +71,9 @@ def main(args):
             "--epochs", str(args.epochs),
             "--batch",  str(args.batch),
             "--lr",     str(args.lr),
+            "--workers", str(args.workers),
+            "--weight_decay", str(args.weight_decay),
+            "--patience", str(args.patience),
         ]
         if args.resume:
             train_cmd.append("--resume")
@@ -111,10 +120,13 @@ if __name__ == "__main__":
     p.add_argument("--eval_only",    action="store_true", help="Only evaluate + postprocess")
     p.add_argument("--extract_only", action="store_true", help="Only run spectral extraction")
     p.add_argument("--resume",       action="store_true", help="Resume training from checkpoint")
-    # Training
-    p.add_argument("--epochs", type=int,   default=100)
-    p.add_argument("--batch",  type=int,   default=8)
-    p.add_argument("--lr",     type=float, default=1e-4)
+    # Training (imported from config)
+    p.add_argument("--epochs", type=int,   default=EPOCHS)
+    p.add_argument("--batch",  type=int,   default=BATCH_SIZE)
+    p.add_argument("--lr",     type=float, default=LR)
+    p.add_argument("--workers", type=int,  default=NUM_WORKERS)
+    p.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    p.add_argument("--patience", type=int, default=PATIENCE)
     # Random Forest
     p.add_argument("--with_rf",   action="store_true", help="Also train Random Forest")
     p.add_argument("--with_si",   action="store_true", help="Include spectral indices for RF")

@@ -40,10 +40,10 @@ def refine_mask(binary: np.ndarray, min_pixels: int = MIN_DEBRIS_PIXELS) -> np.n
 def vectorise_patch(pred_path: str) -> list:
     """
     Returns a list of GeoJSON feature dicts for debris polygons in one patch.
-    pred_path : path to _pred.tif (class indices 0-14 stored as uint8 DN 1-15)
+    pred_path : path to _pred.tif (class indices 0/1 stored as uint8)
     """
     with rasterio.open(pred_path) as src:
-        data      = src.read(1)   # uint8 DN 1-15
+        data      = src.read(1)   # uint8 0=debris, 1=not-debris
         transform = src.transform
         crs       = src.crs
 

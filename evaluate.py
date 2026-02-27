@@ -93,7 +93,12 @@ def evaluate(args):
     # ── Model ──
     model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES,
                              pretrained=False).to(device)
-    ck = torch.load(args.ckpt, map_location=device)
+    # Fix for PyTorch 2.6+ checkpoint loading
+    try:
+        ck = torch.load(args.ckpt, map_location=device, weights_only=False)
+    except TypeError:
+        # For older PyTorch versions
+        ck = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(ck["model"])
     model.eval()
     log.info(f"Loaded checkpoint: {args.ckpt}")
@@ -106,14 +111,30 @@ def evaluate(args):
     cm = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
     pred_out_dir = os.path.join(OUTPUTS_DIR, f"predicted_{args.split}")
 
+    from scipy.ndimage import label
+    from configs.config import MIN_DEBRIS_PIXELS
     for batch in dl:
         imgs  = batch["image"].to(device)
         masks = batch["mask"]   # (B,H,W) cpu
 
+
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             logits = model(imgs)
-        preds = logits.argmax(dim=1).cpu().numpy()   # (B,H,W)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()  # (B,2,H,W)
+        debris_prob = probs[:,0,:,:]
+        threshold = 0.7  # Only predict debris if prob > 0.7
+        preds = (debris_prob > threshold).astype(np.uint8)
         masks_np = masks.numpy()
+        preds = np.where(preds == 0, 0, 1)
+        masks_np = np.where(masks_np == 0, 0, 1)
+
+        # Post-processing: remove small debris blobs
+        for i in range(preds.shape[0]):
+            debris_mask = (preds[i] == 0)
+            labeled, n = label(debris_mask)
+            for region in range(1, n+1):
+                if (labeled == region).sum() < MIN_DEBRIS_PIXELS:
+                    preds[i][labeled == region] = 1  # set to not-debris
 
         # Confusion matrix
         for p, t in zip(preds, masks_np):
@@ -128,7 +149,7 @@ def evaluate(args):
                 save_predicted_mask(p, pid, pred_out_dir)
 
     # ── Per-class metrics ──
-    class_names = [CLASS_NAMES[i+1] for i in range(NUM_CLASSES)]
+    class_names = [CLASS_NAMES[i] for i in range(NUM_CLASSES)]
     tp   = np.diag(cm).astype(float)
     fp   = cm.sum(0) - tp
     fn   = cm.sum(1) - tp
