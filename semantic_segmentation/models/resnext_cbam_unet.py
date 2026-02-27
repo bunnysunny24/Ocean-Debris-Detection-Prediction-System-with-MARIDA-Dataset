@@ -179,11 +179,13 @@ class HybridLoss(nn.Module):
     """
 
     def __init__(self, class_weights=None, dice_weight: float = 0.4,
-                 ignore_index: int = -1):
+                 ignore_index: int = -1, use_focal: bool = False, focal_gamma: float = 2.0):
         super().__init__()
-        self.class_weights = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
+        self.class_weights = torch.tensor(class_weights, dtype=torch.float32) if class_weights is not None else None
         self.dice_w      = dice_weight
         self.ignore_idx  = ignore_index
+        self.use_focal   = use_focal
+        self.focal_gamma = focal_gamma
         self.ce = None  # Will be initialized per device
 
     def _dice(self, pred_soft, target, num_classes):
@@ -211,6 +213,11 @@ class HybridLoss(nn.Module):
         # Re-create CE loss on the correct device
         self.ce = torch.nn.CrossEntropyLoss(weight=weights, ignore_index=self.ignore_idx, reduction="none")
         ce_map = self.ce(logits, target.clamp(min=0))   # ignore nodata handled by CE
+        if self.use_focal:
+            # Focal loss scaling
+            pt = torch.exp(-ce_map)
+            focal_factor = (1 - pt) ** self.focal_gamma
+            ce_map = focal_factor * ce_map
         if conf_weights is not None:
             ce_map = ce_map * conf_weights
         ce_loss = ce_map.mean()
