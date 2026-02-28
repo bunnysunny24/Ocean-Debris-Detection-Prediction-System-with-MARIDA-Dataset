@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from utils.dataset import MARIDADataset, normalise
-from semantic_segmentation.models.resnext_cbam_unet import ResNeXtCBAMUNet
+import segmentation_models_pytorch as smp
 from configs.config import INPUT_BANDS, NUM_CLASSES, CHECKPOINTS_DIR
 
 # Visualization output directory
@@ -23,7 +23,13 @@ def overlay_mask(image, mask, alpha=0.5):
 def visualize_predictions(split="val", n=16, ckpt_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = MARIDADataset(split, augment_data=False)
-    model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES, pretrained=False).to(device)
+    model = smp.DeepLabV3Plus(
+        encoder_name="resnet50",
+        encoder_weights=None,
+        in_channels=INPUT_BANDS,
+        classes=NUM_CLASSES,
+        activation=None,
+    ).to(device)
     if ckpt_path is None:
         ckpt_path = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_best.pth")
     ck = torch.load(ckpt_path, map_location=device)

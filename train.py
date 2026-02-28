@@ -23,7 +23,8 @@ from configs.config import (
     CHECKPOINTS_DIR, LOGS_DIR,
 )
 from utils.dataset import MARIDADataset
-from semantic_segmentation.models.resnext_cbam_unet import ResNeXtCBAMUNet, HybridLoss
+import segmentation_models_pytorch as smp
+from semantic_segmentation.models.resnext_cbam_unet import HybridLoss
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -48,10 +49,20 @@ def compute_iou(pred, target, num_classes, ignore_index=-1):
 def train_epoch(model, loader, optimizer, criterion, device, scaler):
     model.train()
     total_loss = 0.0
+    import time
+    try:
+        import psutil, os
+        psutil_available = True
+    except ImportError:
+        psutil_available = False
     for batch in tqdm(loader, desc="[train]"):
+        batch_start = time.time()
         imgs   = batch["image"].to(device)
         masks  = batch["mask"].to(device)
         confs  = batch["conf"].to(device)
+
+        # Debug: tensor shapes
+        print(f"[DEBUG] imgs shape: {imgs.shape}, masks shape: {masks.shape}, confs shape: {confs.shape}")
 
         # Debug: count debris pixels (class 0)
         debris_pixels = (masks == 0).sum().item()
@@ -59,6 +70,10 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler):
         print(f"[TRAIN DEBUG] Batch mask counts: debris={debris_pixels}, not_debris={not_debris_pixels}")
         if debris_pixels == 0:
             print("[WARN] No debris pixels in this batch!")
+
+        # Debug: print current learning rate
+        for param_group in optimizer.param_groups:
+            print(f"[DEBUG] Current learning rate: {param_group['lr']}")
 
         optimizer.zero_grad()
         try:
@@ -82,6 +97,13 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         scaler.step(optimizer)
         scaler.update()
+
+        # Debug: batch timing
+        print(f"[DEBUG] Batch time: {time.time() - batch_start:.2f}s")
+
+        # Debug: memory usage
+        if psutil_available:
+            print(f"[DEBUG] RAM usage: {psutil.Process(os.getpid()).memory_info().rss / 1e9:.2f} GB")
 
         total_loss += loss.item()
     return total_loss / len(loader)
@@ -181,17 +203,22 @@ def main(args):
     val_dl   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False,
                           num_workers=args.workers, pin_memory=True)
 
-    # Model
-    model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES,
-                             pretrained=True).to(device)
+    # Model: DeepLabV3+ with configurable encoder
+    model = smp.DeepLabV3Plus(
+        encoder_name="resnet50",  # or try "timm-resnest50d", "resnext50_32x4d"
+        encoder_weights="imagenet",
+        in_channels=INPUT_BANDS,
+        classes=NUM_CLASSES,
+        activation=None,
+    ).to(device)
     log.info(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Loss
-    # Use binary class weights and enable focal loss
+    # Loss: Strong rare-class weighting, high dice, focal enabled
     focal = True
     focal_gamma = 2.0
-    class_weights = np.array(CLASS_WEIGHTS)
-    criterion = HybridLoss(class_weights=class_weights, dice_weight=0.4, use_focal=focal, focal_gamma=focal_gamma)
+    # Stronger rare-class weighting (debris is rare)
+    class_weights = np.array([3.0, 1.0])
+    criterion = HybridLoss(class_weights=class_weights, dice_weight=0.7, use_focal=focal, focal_gamma=focal_gamma)
 
     # Optimiser
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -321,8 +348,17 @@ def main(args):
         if mean_iou > best_iou:
             best_iou   = mean_iou
             no_improve = 0
+            # Save best model inside this run folder
             torch.save(ck, ckpt_path)
-            log.info(f"  ✓ New best mIoU: {best_iou:.4f} (epoch {epoch+1}) — best model saved to {ckpt_path}")
+            # Also copy the best model to a canonical path for easy access
+            shared_best = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_best.pth")
+            try:
+                import shutil
+                shutil.copy2(ckpt_path, shared_best)
+                log.info(f"  ✓ New best mIoU: {best_iou:.4f} (epoch {epoch+1}) — saved to {ckpt_path} and copied to {shared_best}")
+            except Exception as e:
+                # Don't fail training if the copy fails; log a warning instead
+                log.warning(f"  ✓ New best mIoU: {best_iou:.4f} (epoch {epoch+1}) — saved to {ckpt_path}, but failed to copy to {shared_best}: {e}")
         else:
             no_improve += 1
             if no_improve >= patience:

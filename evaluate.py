@@ -30,6 +30,10 @@ from configs.config import (
 )
 from utils.dataset import MARIDADataset, _find_tif
 from semantic_segmentation.models.resnext_cbam_unet import ResNeXtCBAMUNet
+try:
+    import segmentation_models_pytorch as smp
+except Exception:
+    smp = None
 
 # Color map for 15 MARIDA classes (index 0-14)
 CLASS_COLORS = [
@@ -57,7 +61,7 @@ def plot_confusion_matrix(cm, class_names, save_path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
-    print(f"Confusion matrix saved → {save_path}")
+    print(f"Confusion matrix saved -> {save_path}")
 
 
 def save_predicted_mask(pred_mask: np.ndarray, patch_id: str, out_dir: str):
@@ -90,16 +94,35 @@ def evaluate(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Model ──
-    model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES,
-                             pretrained=False).to(device)
-    # Fix for PyTorch 2.6+ checkpoint loading
+    # ── Model selection based on checkpoint keys ──
+    # Load checkpoint first, then instantiate matching architecture
     try:
         ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     except TypeError:
-        # For older PyTorch versions
         ck = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(ck["model"])
+
+    state_keys = list(ck.get("model", {}).keys()) if isinstance(ck, dict) else []
+    use_smp = any(k.startswith("encoder.") or k.startswith("decoder.") or k.startswith("segmentation_head.") for k in state_keys)
+
+    if use_smp and smp is not None:
+        log.info("Checkpoint looks like an smp model. Instantiating DeepLabV3Plus to match checkpoint.")
+        model = smp.DeepLabV3Plus(
+            encoder_name="resnet50",
+            encoder_weights="imagenet",
+            in_channels=INPUT_BANDS,
+            classes=NUM_CLASSES,
+            activation=None,
+        ).to(device)
+    else:
+        model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES,
+                                pretrained=False).to(device)
+
+    # Try strict load first, fall back to non-strict with a warning
+    try:
+        model.load_state_dict(ck["model"])
+    except RuntimeError as e:
+        log.warning(f"Strict state_dict load failed: {e}. Trying non-strict load and continuing.")
+        model.load_state_dict(ck["model"], strict=False)
     model.eval()
     log.info(f"Loaded checkpoint: {args.ckpt}")
 
@@ -122,19 +145,22 @@ def evaluate(args):
             logits = model(imgs)
         probs = torch.softmax(logits, dim=1).cpu().numpy()  # (B,2,H,W)
         debris_prob = probs[:,0,:,:]
-        threshold = 0.7  # Only predict debris if prob > 0.7
+        threshold = args.threshold if hasattr(args, 'threshold') else 0.7
         preds = (debris_prob > threshold).astype(np.uint8)
         masks_np = masks.numpy()
         preds = np.where(preds == 0, 0, 1)
         masks_np = np.where(masks_np == 0, 0, 1)
 
-        # Post-processing: remove small debris blobs
-        for i in range(preds.shape[0]):
-            debris_mask = (preds[i] == 0)
-            labeled, n = label(debris_mask)
-            for region in range(1, n+1):
-                if (labeled == region).sum() < MIN_DEBRIS_PIXELS:
-                    preds[i][labeled == region] = 1  # set to not-debris
+        # Post-processing: remove small debris blobs (configurable)
+        if not args.no_postprocessing:
+            min_pix = args.min_debris_pixels if hasattr(args, 'min_debris_pixels') else MIN_DEBRIS_PIXELS
+            for i in range(preds.shape[0]):
+                # preds: 1 == debris, 0 == not-debris
+                debris_mask = (preds[i] == 1)
+                labeled, n = label(debris_mask)
+                for region in range(1, n+1):
+                    if (labeled == region).sum() < min_pix:
+                        preds[i][labeled == region] = 0  # set small regions to not-debris
 
         # Confusion matrix
         for p, t in zip(preds, masks_np):
@@ -162,12 +188,12 @@ def evaluate(args):
     dice      = 2 * tp / (2 * tp + fp + fn + 1e-8)
     acc       = tp.sum() / total
 
-    log.info("\n" + "─"*80)
+    log.info("\n" + "-"*80)
     log.info(f"{'Class':<30} {'IoU':>8} {'F1':>8} {'Prec':>8} {'Recall':>8} {'Dice':>8}")
-    log.info("─"*80)
+    log.info("-"*80)
     for i, name in enumerate(class_names):
         log.info(f"{name:<30} {iou[i]:8.4f} {f1[i]:8.4f} {precision[i]:8.4f} {recall[i]:8.4f} {dice[i]:8.4f}")
-    log.info("─"*80)
+    log.info("-"*80)
     log.info(f"{'Mean (valid classes)':<30} {np.nanmean(iou):8.4f} {np.nanmean(f1):8.4f}")
     log.info(f"Overall pixel accuracy: {acc:.4f}")
 

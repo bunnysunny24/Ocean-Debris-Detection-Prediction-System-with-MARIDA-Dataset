@@ -12,6 +12,7 @@ Usage:
     python postprocess.py --pred_dir outputs/predicted_test --out_dir outputs/geospatial
 """
 
+
 import os, sys, argparse, json, glob
 import numpy as np
 import rasterio
@@ -22,12 +23,35 @@ from shapely.geometry import shape, mapping, MultiPolygon
 from shapely.ops import unary_union
 import pandas as pd
 from skimage import morphology
+try:
+    import pydensecrf.densecrf as dcrf
+    from pydensecrf.utils import unary_from_softmax
+    HAS_CRF = True
+except ImportError:
+    HAS_CRF = False
 
 sys.path.insert(0, os.path.dirname(__file__))
 from configs.config import MIN_DEBRIS_PIXELS, CLASS_NAMES
 
 DEBRIS_CLASS_IDX = 0   # index 0 = Marine Debris (DN 1)
 
+
+
+def crf_refine(image: np.ndarray, mask_probs: np.ndarray, n_classes: int = 2, crf_iters: int = 5) -> np.ndarray:
+    """
+    Refine mask using DenseCRF. image: (H,W,3), mask_probs: (C,H,W)
+    Returns: (H,W) refined mask
+    """
+    if not HAS_CRF:
+        return mask_probs.argmax(0)
+    h, w = image.shape[:2]
+    d = dcrf.DenseCRF2D(w, h, n_classes)
+    unary = unary_from_softmax(mask_probs)
+    d.setUnaryEnergy(unary)
+    d.addPairwiseGaussian(sxy=3, compat=3)
+    d.addPairwiseBilateral(sxy=80, srgb=13, rgbim=image, compat=10)
+    Q = d.inference(crf_iters)
+    return np.array(Q).reshape((n_classes, h, w)).argmax(0)
 
 def refine_mask(binary: np.ndarray, min_pixels: int = MIN_DEBRIS_PIXELS) -> np.ndarray:
     """Fill holes, remove small objects, dilate slightly."""
@@ -46,9 +70,28 @@ def vectorise_patch(pred_path: str) -> list:
         data      = src.read(1)   # uint8 0=debris, 1=not-debris
         transform = src.transform
         crs       = src.crs
+        # Try to load original image for CRF
+        try:
+            img_path = pred_path.replace("_pred.tif", ".tif")
+            if os.path.exists(img_path):
+                img = rasterio.open(img_path).read([1,2,3]).transpose(1,2,0)
+                img = ((img - img.min()) / (img.max() - img.min() + 1e-8) * 255).astype(np.uint8)
+            else:
+                img = None
+        except Exception:
+            img = None
 
     # Debris is DN=1 → index 0
-    binary = (data == 1).astype(np.uint8)
+    # Optionally apply CRF if available and image is present
+    if HAS_CRF and img is not None:
+        # Fake softmax: one-hot for now (replace with real probs if available)
+        mask_probs = np.zeros((2, data.shape[0], data.shape[1]), dtype=np.float32)
+        mask_probs[0] = (data == 0)
+        mask_probs[1] = (data == 1)
+        crf_mask = crf_refine(img, mask_probs, n_classes=2, crf_iters=5)
+        binary = (crf_mask == 0).astype(np.uint8)
+    else:
+        binary = (data == 1).astype(np.uint8)
     binary = refine_mask(binary)
 
     if binary.sum() == 0:

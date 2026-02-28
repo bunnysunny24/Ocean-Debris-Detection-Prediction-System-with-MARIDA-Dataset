@@ -1,0 +1,49 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              728320.0,
+              2087020.0
+            ],
+            [
+              728320.0,
+              2084460.0
+            ],
+            [
+              730880.0,
+              2084460.0
+            ],
+            [
+              730880.0,
+              2087020.0
+            ],
+            [
+              728320.0,
+              2087020.0
+            ]
+          ]
+        ]
+      },
+      "properties": {
+        "class": "Marine Debris",
+        "patch": "22-12-20_18QYF_0",
+        "area_crs": 6553600.0,
+        "centroid_lon": 729600.0,
+        "centroid_lat": 2085740.0,
+        "bbox": [
+          728320.0,
+          2084460.0,
+          730880.0,
+          2087020.0
+        ],
+        "crs": "EPSG:32618"
+      }
+    }
+  ]
+}

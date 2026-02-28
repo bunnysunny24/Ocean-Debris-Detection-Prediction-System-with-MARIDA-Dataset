@@ -13,6 +13,9 @@ import torch
 from torch.utils.data import Dataset
 import rasterio
 from scipy.ndimage import map_coordinates, gaussian_filter
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import cv2
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from configs.config import (
@@ -153,21 +156,22 @@ def _spectral_brightness(img, rng=BRIGHTNESS_RANGE):
     return np.clip(img + shift, 0.0, 1.0)
 
 
-def augment(img: np.ndarray, mask: np.ndarray):
-    """Apply random augmentation pipeline. img: (B,H,W) float32, mask: (H,W) int64."""
-    if random.random() < AUG_PROB:
-        img, mask = _random_hflip(img, mask)
-    if random.random() < AUG_PROB:
-        img, mask = _random_vflip(img, mask)
-    if random.random() < AUG_PROB:
-        img, mask = _random_rot90(img, mask)
-    if random.random() < AUG_PROB * 0.5:
-        img, mask = _elastic_transform(img, mask)
-    if random.random() < AUG_PROB:
-        img = _spectral_noise(img)
-    if random.random() < AUG_PROB:
-        img = _spectral_brightness(img)
-    return img, mask
+
+# ── Albumentations advanced augmentation pipeline ──
+def get_advanced_augment():
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        # Only apply ColorJitter if image has 3 channels (RGB). Sentinel-2 has 11 bands, so skip or replace with per-band brightness jitter.
+        # A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.7),
+        A.RandomResizedCrop(size=(PATCH_SIZE, PATCH_SIZE), scale=(0.7, 1.0), ratio=(0.75, 1.33), p=0.7),
+        A.GaussNoise(p=0.5),  # removed var_limit
+        A.ElasticTransform(alpha=ELASTIC_ALPHA, sigma=ELASTIC_SIGMA, p=0.3),  # removed alpha_affine
+        A.GridDistortion(p=0.2),
+        A.CoarseDropout(p=0.3),  # removed all other arguments
+        # ToTensorV2() will be applied later
+    ])
 
 
 # ── Main Dataset ──────────────────────────────────────────────────────────────
@@ -201,7 +205,7 @@ class MARIDADataset(Dataset):
         with open(split_file) as f:
             patch_ids = [l.strip() for l in f if l.strip()]
 
-        # Aggressive oversampling: duplicate debris-rich patches
+        # Aggressive oversampling: duplicate debris-rich patches and hard negatives
         if split == "train":
             debris_patches = []
             normal_patches = []
@@ -215,7 +219,8 @@ class MARIDADataset(Dataset):
                     with rasterio.open(mask_tif) as src:
                         mask = src.read(1).astype(np.int64) - 1
                     if (mask == 0).sum() > 10:
-                        debris_patches.extend([pid]*5)
+                        # Oversample debris patches even more
+                        debris_patches.extend([pid]*12)
                         is_debris = True
                 if not is_debris and tif:
                     with rasterio.open(tif) as src:
@@ -223,7 +228,7 @@ class MARIDADataset(Dataset):
                     img_norm = normalise(img)
                     # Hard negative: bright or high-variance patches (likely confused with debris)
                     if img_norm.mean() > 0.6 or img_norm.std() > 0.25:
-                        hard_negatives.extend([pid]*3)
+                        hard_negatives.extend([pid]*8)
                         is_hard_negative = True
                 if not is_debris and not is_hard_negative:
                     normal_patches.append(pid)
@@ -289,16 +294,23 @@ class MARIDADataset(Dataset):
         # ── Normalise ──
         img = normalise(img)
 
+        # ── Albumentations expects (H,W,C) for images, (H,W) for mask
+        img = np.transpose(img, (1, 2, 0))  # (H,W,B)
 
-        # ── Augment ──
+        # ── Advanced Augmentation ──
         if self.augment_data:
-            # Strongest augmentation for debris patches
-            if (mask == 0).sum() > 0:
-                for _ in range(5):
-                    img, mask = augment(img, mask)
-            else:
-                for _ in range(2):
-                    img, mask = augment(img, mask)
+            aug = get_advanced_augment()
+            augmented = aug(image=img, mask=mask)
+            img = augmented["image"]
+            mask = augmented["mask"]
+            # Mixup/Cutmix hooks (optional, can be added here)
+            # TODO: Add mixup/cutmix logic if desired
+        else:
+            img = img.copy()
+            mask = mask.copy()
+
+        # Convert back to (B,H,W)
+        img = np.transpose(img, (2, 0, 1))
 
         img  = torch.from_numpy(img).float()
         mask = torch.from_numpy(mask).long()

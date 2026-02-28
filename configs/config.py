@@ -36,12 +36,14 @@ CLASS_WEIGHTS = [1.0, 1.0]  # Debris (rare), Not Debris
 
 # ─────────────────────────── TRAINING ────────────────────────
 
+
+# ── Tuned hyperparameters for best performance ──
 BATCH_SIZE   = 16
-EPOCHS       = 100
-LR           = 1e-4
-WEIGHT_DECAY = 1e-5
-PATIENCE     = 15           # early-stopping patience
-NUM_WORKERS  = 24           # Use all 24 CPU cores for DataLoader
+EPOCHS       = 120
+LR           = 5e-5
+WEIGHT_DECAY = 1e-4
+PATIENCE     = 20           # early-stopping patience
+NUM_WORKERS  = 4           # Use all 24 CPU cores for DataLoader
 
 # ─────────────────────────── AUGMENTATION ────────────────────
 AUG_PROB          = 0.5
