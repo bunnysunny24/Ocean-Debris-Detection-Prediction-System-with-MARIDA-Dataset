@@ -1,0 +1,24 @@
+# Marine Debris Detection & Drift Prediction
+# Install with: pip install -r requirements.txt
+#
+# For GPU (CUDA 11.x):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# For CPU only:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+torch>=1.13.0
+torchvision>=0.14.0
+# PyTorch installation (recommended):
+#   On Windows, always install PyTorch and torchvision via conda for best compatibility:
+#   conda install pytorch torchvision cpuonly -c pytorch
+#   (or add cudatoolkit for GPU)
+# Remove torch/torchvision from pip requirements to avoid DLL issues.
+
+# Optional – for real ocean/wind NetCDF data
+
+# Data augmentation
+
+albumentations>=1.0.0
+
+# Segmentation models
+segmentation-models-pytorch>=0.3.0

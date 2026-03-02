@@ -1,0 +1,329 @@
+"""
+train.py
+--------
+End-to-end training for the ResNeXt-50 + CBAM U-Net on MARIDA.
+
+Usage:
+    python train.py
+    python train.py --epochs 80 --batch 4 --lr 5e-5
+"""
+
+import os, sys, argparse, time, logging
+from tqdm import tqdm
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from configs.config import (
+    INPUT_BANDS, NUM_CLASSES, CLASS_WEIGHTS,
+    BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, PATIENCE, NUM_WORKERS,
+    CHECKPOINTS_DIR, LOGS_DIR,
+)
+from utils.dataset import MARIDADataset
+import segmentation_models_pytorch as smp
+from semantic_segmentation.models.resnext_cbam_unet import HybridLoss
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+def compute_iou(pred, target, num_classes, ignore_index=-1):
+    ious = []
+    pred   = pred.view(-1)
+    target = target.view(-1)
+    valid  = target != ignore_index
+    pred, target = pred[valid], target[valid]
+    for c in range(num_classes):
+        tp = ((pred == c) & (target == c)).sum().float()
+        fp = ((pred == c) & (target != c)).sum().float()
+        fn = ((pred != c) & (target == c)).sum().float()
+        denom = tp + fp + fn
+        ious.append((tp / (denom + 1e-8)).item() if denom > 0 else float("nan"))
+    return ious
+
+
+# ── Train / Val loops ─────────────────────────────────────────────────────────
+
+def train_epoch(model, loader, optimizer, criterion, device, scaler):
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+    for batch in tqdm(loader, desc="[train]"):
+        imgs   = batch["image"].to(device)
+        masks  = batch["mask"].to(device)
+        confs  = batch["conf"].to(device)
+
+        optimizer.zero_grad()
+        try:
+            autocast_ctx = torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda"))
+        except Exception:
+            autocast_ctx = torch.cuda.amp.autocast(enabled=(device.type == "cuda"))
+        with autocast_ctx:
+            logits = model(imgs)
+            loss   = criterion(logits, masks, confs)
+
+        if torch.isnan(loss):
+            continue
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        n_batches += 1
+    return total_loss / max(n_batches, 1)
+
+
+@torch.no_grad()
+def val_epoch(model, loader, criterion, device, num_classes):
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    all_preds, all_masks = [], []
+    for batch in tqdm(loader, desc="[val]"):
+        imgs   = batch["image"].to(device)
+        masks  = batch["mask"].to(device)
+        confs  = batch["conf"].to(device)
+
+        try:
+            autocast_ctx = torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda"))
+        except Exception:
+            autocast_ctx = torch.cuda.amp.autocast(enabled=(device.type == "cuda"))
+        with autocast_ctx:
+            logits = model(imgs)
+            loss   = criterion(logits, masks, confs)
+
+        if torch.isnan(loss):
+            continue
+
+        total_loss += loss.item()
+        n_batches += 1
+        preds = logits.argmax(dim=1)
+        all_preds.append(preds.cpu())
+        all_masks.append(masks.cpu())
+
+    if len(all_preds) == 0:
+        return float('nan'), float('nan'), [float('nan')]*num_classes, float('nan'), float('nan'), float('nan')
+    preds_cat = torch.cat([p.view(-1) for p in all_preds])
+    masks_cat = torch.cat([m.view(-1) for m in all_masks])
+    ious = compute_iou(preds_cat, masks_cat, num_classes)
+    mean_iou = np.nanmean(ious)
+
+    # Debris precision / recall / F1 (class 0 = debris)
+    valid = masks_cat != -1
+    p_v = preds_cat[valid]
+    m_v = masks_cat[valid]
+    debris_tp = ((p_v == 0) & (m_v == 0)).sum().item()
+    debris_fp = ((p_v == 0) & (m_v != 0)).sum().item()
+    debris_fn = ((p_v != 0) & (m_v == 0)).sum().item()
+    d_prec = debris_tp / (debris_tp + debris_fp + 1e-8)
+    d_rec  = debris_tp / (debris_tp + debris_fn + 1e-8)
+    d_f1   = 2 * d_prec * d_rec / (d_prec + d_rec + 1e-8)
+
+    return total_loss / max(n_batches, 1), mean_iou, ious, d_prec, d_rec, d_f1
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main(args):
+    # Logging
+    import datetime
+    log_dir = os.path.join(LOGS_DIR, "external_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"train_{timestamp}.log")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    stream_handler = logging.StreamHandler(sys.stdout)
+    try:
+        stream_handler.stream.reconfigure(encoding='utf-8')
+    except Exception:
+        pass  # For Python <3.7 or if reconfigure is unavailable
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(message)s",
+        handlers=[file_handler, stream_handler],
+    )
+    log = logging.getLogger()
+    log.info(f"Logging to {log_path}")
+
+    # Create a timestamped checkpoint directory for this run
+    ckpt_dir = os.path.join(CHECKPOINTS_DIR, f"run_{timestamp}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Prepare CSV for metrics logging
+    import csv
+    metrics_csv_path = os.path.join(ckpt_dir, "metrics.csv")
+    metrics_csv_file = open(metrics_csv_path, mode="w", newline="", encoding="utf-8")
+    metrics_writer = csv.writer(metrics_csv_file)
+    metrics_writer.writerow([
+        "epoch", "train_loss", "val_loss", "mIoU",
+        "iou_debris", "iou_not_debris",
+        "precision", "recall", "f1"
+    ])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Device: {device}")
+
+    # Datasets
+    train_ds = MARIDADataset("train", augment_data=True)
+    val_ds   = MARIDADataset("val",   augment_data=False)
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                          num_workers=args.workers, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False,
+                          num_workers=args.workers, pin_memory=True)
+
+    # Model: DeepLabV3+ with strong encoder for best debris detection
+    model = smp.DeepLabV3Plus(
+        encoder_name="resnext50_32x4d",
+        encoder_weights="imagenet",
+        in_channels=INPUT_BANDS,
+        classes=NUM_CLASSES,
+        activation=None,
+    ).to(device)
+    log.info(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Loss: moderate debris weighting + Dice (now nodata-safe)
+    focal = True
+    focal_gamma = 2.0
+    class_weights = np.array(CLASS_WEIGHTS, dtype=np.float32)
+    criterion = HybridLoss(class_weights=class_weights, dice_weight=0.7, use_focal=focal, focal_gamma=focal_gamma)
+
+    # Optimiser with warmup + cosine annealing
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs - 5, 1), eta_min=1e-6)
+    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[5])
+    try:
+        scaler = torch.amp.GradScaler(device if device.type == "cuda" else None, enabled=(device.type == "cuda"))
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+    # Resume?
+    start_epoch  = 0
+    best_iou     = 0.0
+    no_improve   = 0
+    ckpt_path    = os.path.join(ckpt_dir, "best.pth")
+
+    if args.resume and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        start_epoch = ck["epoch"] + 1
+        best_iou    = ck["best_iou"]
+        log.info(f"Resumed from epoch {start_epoch}, best mIoU={best_iou:.4f}")
+
+    writer = SummaryWriter(log_dir=os.path.join(LOGS_DIR, "tsboard"))
+
+    log.info("─" * 60)
+    patience = args.patience if hasattr(args, 'patience') else PATIENCE
+    for epoch in range(start_epoch, args.epochs):
+        t0 = time.time()
+
+        train_loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler)
+        val_loss, mean_iou, per_class_iou, debris_precision, debris_recall, debris_f1 = val_epoch(model, val_dl, criterion, device, NUM_CLASSES)
+
+        elapsed = time.time() - t0
+        log.info(
+            f"Epoch {epoch+1}/{args.epochs}  "
+            f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"mIoU={mean_iou:.4f}  ({elapsed:.1f}s)"
+        )
+        print(f"[CHECKPOINT] Saving model for epoch {epoch+1} to {ckpt_dir}")
+        # Save checkpoint for every epoch
+        epoch_ckpt = {
+            "epoch": epoch, "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(), "best_iou": best_iou,
+        }
+        torch.save(epoch_ckpt, os.path.join(ckpt_dir, f"epoch_{epoch+1:03d}.pth"))
+        # Log per-class IoU and detection counts (binary)
+        class_names = ["Debris", "Not Debris"]
+        for i, (iou, cname) in enumerate(zip(per_class_iou, class_names)):
+            log.info(f"Class {i}: {cname:15s} IoU={iou:.4f}")
+        log.info(f"Debris precision: {debris_precision:.4f}  recall: {debris_recall:.4f}  F1: {debris_f1:.4f}")
+
+        # Save metrics to CSV
+        metrics_writer.writerow([
+            epoch+1, train_loss, val_loss, mean_iou,
+            per_class_iou[0] if len(per_class_iou) > 0 else float('nan'),
+            per_class_iou[1] if len(per_class_iou) > 1 else float('nan'),
+            debris_precision, debris_recall, debris_f1
+        ])
+        metrics_csv_file.flush()
+
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/val",   val_loss,   epoch)
+        writer.add_scalar("mIoU/val",   mean_iou,   epoch)
+
+        scheduler.step()
+
+        # Checkpoint
+        # Save last checkpoint (for resuming)
+        ck = {
+            "epoch": epoch, "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(), "best_iou": best_iou,
+        }
+        torch.save(ck, os.path.join(ckpt_dir, "last.pth"))
+
+        # Track best checkpoint by debris F1 (our primary metric)
+        if debris_f1 > best_iou:            # variable still called best_iou for resume compat
+            best_iou   = debris_f1
+            no_improve = 0
+            torch.save(ck, ckpt_path)
+            shared_best = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_best.pth")
+            try:
+                import shutil
+                shutil.copy2(ckpt_path, shared_best)
+                log.info(f"  ✓ New best F1: {best_iou:.4f} (epoch {epoch+1}) — saved to {ckpt_path} and copied to {shared_best}")
+            except Exception as e:
+                log.warning(f"  ✓ New best F1: {best_iou:.4f} (epoch {epoch+1}) — saved to {ckpt_path}, but failed to copy to {shared_best}: {e}")
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                log.info(f"Early stopping after {patience} epochs without improvement.")
+                break
+
+    log.info(f"Training complete. Best val mIoU: {best_iou:.4f}")
+    metrics_csv_file.close()
+    writer.close()
+
+    # Plot and save graphs for all metrics
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    metrics_df = pd.read_csv(metrics_csv_path)
+    metric_names = [
+        ("train_loss", "Train Loss"),
+        ("val_loss", "Validation Loss"),
+        ("mIoU", "Mean IoU"),
+        ("iou_debris", "IoU: Debris"),
+        ("iou_not_debris", "IoU: Not Debris"),
+        ("precision", "Debris Precision"),
+        ("recall", "Debris Recall"),
+        ("f1", "Debris F1")
+    ]
+    for col, title in metric_names:
+        plt.figure()
+        plt.plot(metrics_df["epoch"], metrics_df[col], marker="o")
+        plt.xlabel("Epoch")
+        plt.ylabel(title)
+        plt.title(title + " vs. Epoch")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(ckpt_dir, f"{col}.png"))
+        plt.close()
+    log.info(f"Saved metric graphs to {ckpt_dir}")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs",  type=int,   default=EPOCHS)
+    p.add_argument("--batch",   type=int,   default=BATCH_SIZE)
+    p.add_argument("--lr",      type=float, default=LR)
+    p.add_argument("--workers", type=int,   default=NUM_WORKERS)
+    p.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+    p.add_argument("--patience", type=int, default=PATIENCE)
+    p.add_argument("--resume",  action="store_true")
+    main(p.parse_args())
