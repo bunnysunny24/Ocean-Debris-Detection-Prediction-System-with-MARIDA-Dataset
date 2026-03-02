@@ -1,0 +1,914 @@
+\documentclass[conference,letterpaper]{IEEEtran}
+
+\usepackage{graphicx}
+%\usepackage[draft]{graphicx}
+%\usepackage{subcaption}
+\usepackage[caption=false,font=footnotesize]{subfig}
+%\usepackage{fixltx2e}
+%\usepackage{gensymb}
+%\usepackage{todonotes}
+\usepackage{url}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+
+\hyphenation{op-tical net-works semi-conduc-tor}
+
+% Move this OUTSIDE \author{}
+\newcommand{\authorblock}[1]{%
+\begin{minipage}[t]{0.45\linewidth}
+\centering
+#1
+\end{minipage}
+}
+
+\begin{document}
+
+\title{Advanced Deep Learning-Based Marine Debris Detection and Drift Prediction}
+
+\author{
+\makebox[\linewidth][c]{%
+\begin{minipage}{0.95\linewidth}
+
+\begin{tabular}{@{}c@{\hspace{0.1\linewidth}}c@{}}
+
+\authorblock{
+\textbf{Dr. Sandhia G K} \\
+Department of Computing Technologies \\
+SRM Institute of Science and Technology \\
+Kattankulathur, Tamil Nadu, India \\
+sandhiag@srmist.edu.in
+}
+&
+\authorblock{
+\textbf{Dr. Girirajan S} \\
+Department of Computing Technologies \\
+SRM Institute of Science and Technology \\
+Kattankulathur, Tamil Nadu, India \\
+girirajs1@srmist.edu.in
+}
+\\[6em]
+
+\authorblock{
+\textbf{Dachapalli Bhavashesh} \\
+Department of Computing Technologies \\
+SRM Institute of Science and Technology \\
+Kattankulathur, Tamil Nadu, India \\
+bd3928@srmist.edu.in
+}
+&
+\authorblock{
+\textbf{Guruguntla Sai Renuka} \\
+Department of Computing Technologies \\
+SRM Institute of Science and Technology \\
+Kattankulathur, Tamil Nadu, India \\
+rg3729@srmist.edu.in
+}
+
+\end{tabular}
+
+\end{minipage}
+}
+}
+
+\maketitle
+
+
+\begin{abstract}
+Marine plastic pollution poses a significant threat to ocean ecosystems and necessitates scalable automated monitoring solutions. This paper presents an integrated deep learning and physics-based framework for floating marine debris detection and short-term drift prediction using multispectral Sentinel-2 imagery and the MARIDA benchmark dataset. The proposed approach employs a modified ResNeXt-50 encoder augmented with Convolutional Block Attention Modules (CBAM) in a U-Net decoder architecture for 15-class semantic segmentation of marine surface features. Robust percentile-based spectral normalization, multi-level data augmentation using the Albumentations pipeline, and confidence-weighted loss masking improve generalization under varying oceanic and atmospheric conditions. Debris-rich patch oversampling and hard negative mining further address class imbalance during training. Evaluation on the MARIDA test set (207 patches) achieves a mean Intersection over Union (mIoU) of 0.847 and pixel accuracy of 94.7\%, with the Marine Debris class attaining an IoU of 0.834 and F1-score of 0.909 despite severe class imbalance (${\sim}$1.2\% debris pixels). Detected debris regions are subsequently integrated with a physics-based Lagrangian particle tracking model driven by CMEMS surface currents and ERA5 wind fields via fourth-order Runge--Kutta integration. Validation against GPS-tracked surface drifters yields median separation errors of 8.7\,km, 19.3\,km, and 33.8\,km at 24, 48, and 72 hours, respectively, corresponding to up to 44\% improvement over persistence forecasting. The proposed framework demonstrates the feasibility of coupling attention-enhanced satellite segmentation with physics-informed trajectory modeling for operational marine debris monitoring.
+\end{abstract}
+
+\begin{IEEEkeywords}
+marine debris detection, semantic segmentation, Sentinel-2, deep learning, attention mechanisms, ResNeXt, CBAM, U-Net, drift prediction, Lagrangian particle tracking, Albumentations
+\end{IEEEkeywords}
+\section{Introduction}
+
+\subsection{Background and Motivation}
+
+Marine plastic pollution has emerged as a critical environmental challenge,
+with approximately 8 million metric tons of plastic waste entering the oceans
+annually \cite{Jambeck2015, Lebreton2017, Geyer2017}. Accumulated debris
+forms large convergence zones and threatens marine ecosystems through
+entanglement, ingestion, habitat disruption, and chemical contamination
+\cite{Law2010, Wilcox2015, Rochman2016}. Effective mitigation requires
+continuous, large-scale monitoring; however, traditional approaches based on
+in-situ surveys and manual interpretation of satellite imagery are
+labor-intensive, expensive, and limited in spatial and temporal coverage
+\cite{Cozar2014, Eriksen2014}.
+
+Recent advances in multispectral satellite sensing, particularly the
+availability of 10\,m resolution Sentinel-2 imagery, provide enhanced spectral
+and spatial capability for detecting floating materials \cite{Drusch2012,
+Pham2019}. Concurrently, the development of annotated datasets such as MARIDA
+enables supervised learning approaches for marine surface classification
+\cite{Kikaki2022}, creating an opportunity for scalable, automated marine
+debris monitoring systems \cite{Garaba2018, Topouzelis2020}.
+
+\subsection{Research Gap}
+Marine debris typically represents less than 1\% of image pixels, creating severe class imbalance \cite{Kikaki2022, Veit2021}, while spectral similarity between plastics, organic matter, and turbid water complicates discrimination \cite{Garaba2018}. Traditional indices such as the FDI \cite{Biermann2020} rely on handcrafted thresholds, limiting generalization across environments \cite{Hu2009}. Although CNNs have shown strong segmentation performance \cite{Ma2019}, existing encoder--decoder approaches often lack explicit attention mechanisms \cite{Ronneberger2015} and do not fully exploit Sentinel-2's spectral range \cite{Belgiu2016}. Furthermore, debris detection and drift forecasting are typically treated as separate problems \cite{Maximenko2012}, limiting operational applicability in real-world management systems.
+
+\subsection{Research Objectives}
+
+This work aims to develop an integrated operational framework that combines
+automated satellite-based debris detection with physics-driven trajectory
+forecasting. Specifically, the work pursues four objectives: (1) developing a
+preprocessing pipeline utilizing all 11 Sentinel-2 spectral bands with
+percentile-based normalization, multi-level augmentation via the Albumentations
+library, and confidence-weighted loss masking; (2) designing an
+attention-enhanced segmentation model based on ResNeXt-50 with Convolutional
+Block Attention Modules (CBAM) in a U-Net decoder for robust 15-class marine
+surface classification, incorporating debris-rich patch oversampling and hard
+negative mining; (3) implementing post-processing and geospatial vectorization
+for operational deployment; and (4) integrating detected debris regions with a
+physics-based Lagrangian drift prediction module driven by CMEMS ocean
+currents and ERA5 wind fields for 24--72\,hour forecasting.
+
+\subsection{Contributions}
+
+The main contributions of this work are as follows. First, an
+attention-enhanced multi-class segmentation framework leveraging the full
+11-band Sentinel-2 spectral range is proposed for marine debris detection,
+using a ResNeXt-50 encoder with CBAM attention integrated into a U-Net decoder.
+Second, a hybrid weighted loss formulation combined with per-pixel confidence
+map weighting, debris-rich patch oversampling, and hard negative mining is
+introduced to address severe class imbalance inherent in the MARIDA dataset.
+Third, a complete modular pipeline integrating preprocessing, segmentation,
+post-processing, geospatial export, and drift simulation is developed and
+validated. Fourth, a physics-based trajectory forecasting module employing
+Lagrangian particle tracking with calibrated wind leeway coefficients and
+fourth-order Runge--Kutta integration is presented. Collectively, these
+contributions form an end-to-end detection--prediction framework enabling
+near-real-time operational deployment.
+
+\section{Related Work}
+
+\subsection{Satellite-Based Marine Debris Detection}
+Early studies used moderate-resolution sensors such as MODIS and Landsat to analyze large-scale debris accumulation zones \cite{Maximenko2012, Lebreton2012}, though coarse spatial resolution limited detection of smaller aggregations \cite{Cozar2014}. Sentinel-2 addressed this with 10\,m multispectral imagery across visible, NIR, and SWIR bands \cite{Drusch2012}, improving discrimination of floating materials \cite{Garaba2018}.
+
+Biermann~\textit{et al.}~\cite{Biermann2020} proposed the Floating Debris Index (FDI) for plastic detection using Sentinel-2 reflectance, though threshold dependency and sensitivity to atmospheric effects and organic matter confusion limit its robustness \cite{Hu2009, Shen2019}. The MARIDA dataset \cite{Kikaki2022} established a standardized benchmark of 1,381 annotated Sentinel-2 patches across 15 marine surface classes, with deep learning baselines outperforming spectral indices while still facing class imbalance, spectral ambiguity, and multi-scale variability \cite{Kikaki2022, Veit2021}.
+
+\subsection{Deep Learning for Remote Sensing Segmentation}
+
+Encoder--decoder architectures such as U-Net \cite{Ronneberger2015} and
+DeepLabv3+ \cite{Chen2018} have achieved strong performance in semantic
+segmentation tasks. Extensions incorporating multi-scale feature aggregation
+\cite{Zhao2017} and dilated convolutions \cite{Yu2016} have further improved
+contextual modeling. ResNeXt \cite{Xie2017} introduced grouped convolutions to
+enhance feature diversity, while CBAM \cite{Woo2018} incorporated channel and
+spatial attention mechanisms for adaptive feature refinement, showing
+significant gains in complex scene understanding \cite{Oktay2018, Fu2019}.
+Despite their success in general computer vision and land cover mapping
+\cite{Zhu2017, Ma2019}, limited research has applied attention-enhanced
+architectures specifically to multi-class marine debris segmentation using the
+full spectral capability of Sentinel-2 imagery.
+
+\subsection{Ocean Drift Modeling}
+
+Marine debris transport is commonly modeled using Lagrangian particle tracking
+driven by ocean surface currents \cite{Maximenko2012, Lumpkin2017}.
+Large-scale plastic accumulation dynamics have been studied using numerical
+circulation models \cite{Lebreton2012, VanSebille2015}, and operational
+systems employ current forecasts from the Copernicus Marine Environment
+Monitoring Service (CMEMS) with wind-induced drift incorporated via empirical
+leeway coefficients \cite{Yoon2010, Breivik2012}. Integration of ERA5 wind
+reanalysis with ocean circulation models improves short-term trajectory
+prediction accuracy \cite{Hersbach2020}, while ensemble forecasting approaches
+have been proposed to quantify trajectory uncertainty \cite{Rohrs2018}.
+However, most prior studies treat detection and drift simulation as independent
+tasks, and few provide a unified framework coupling automated satellite-based
+detection with physics-informed trajectory forecasting. The present work
+addresses this gap by integrating attention-based deep learning segmentation
+with physics-driven drift prediction within a single operational pipeline.
+\section{Materials and Methods}
+
+\subsection{Dataset Description}
+
+\subsubsection{MARIDA Dataset Overview}
+The MARIDA dataset provides a standardized benchmark for marine debris detection, comprising 48 Sentinel-2 L2A images yielding 1,381 annotated $256{\times}256$ patches across multiple oceanic regions (2016--2021) at 10\,m resolution. Each patch includes a multispectral image, a pixel-level class mask, and a per-pixel confidence map used for loss weighting during training. A 70/15/15 split yields 967 training, 207 validation, and 207 testing patches (Table~\ref{tab:dataset_stats}).
+\begin{table}[!t]
+\caption{MARIDA Dataset Statistics}
+\label{tab:dataset_stats}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Split} & \textbf{Patches} & \textbf{Percentage} & \textbf{Usage} \\
+\midrule
+Training   & 967  & 70\%  & Model training \\
+Validation & 207  & 15\%  & Hyperparameter tuning \\
+Testing    & 207  & 15\%  & Performance evaluation \\
+\midrule
+\textbf{Total} & \textbf{1{,}381} & \textbf{100\%} & 48 Sentinel-2 scenes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Sentinel-2 Spectral Configuration}
+All 11 Sentinel-2 bands are used (B10 excluded): B1--B4 (443--665\,nm), B5--B7 (Red Edge, 705--783\,nm), B8/B8A (NIR, 842/865\,nm), and B11/B12 (SWIR, 1610/2190\,nm), resampled to 10\,m via bilinear interpolation. This visible-to-SWIR coverage is essential for debris discrimination (Fig.~\ref{fig:spectral_bands}). In addition to raw band reflectances, per-pixel spectral indices (NDVI, NDWI, FDI, PI, RNDVI) and GLCM texture features are extracted and available for complementary classical machine learning pipelines.
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{fig_spectral_bands_a.png}
+\caption{Sentinel-2 spectral bands and signatures of key marine surface features.}
+\label{fig:spectral_bands}
+\end{figure}
+
+\subsubsection{Semantic Annotation Framework}
+MARIDA provides pixel-level annotations across 15 classes, including Marine Debris (Class~1), Sargassum, Ships, Clouds, and various water types. Class~1 receives loss weight $w=2.0$ to prioritize debris detection and Class~0 receives $w=0.5$ to suppress background influence. Per-pixel confidence scores (0--2) from the annotation process are used directly as confidence map weights during training to downweight uncertain pixels. Representative patches are shown in Fig.~\ref{fig:annotations}.
+\begin{figure}[!t]
+\centering
+\subfloat[RGB]{\includegraphics[width=0.48\columnwidth]{patch1_rgb.png}}\hfill
+\subfloat[Mask]{\includegraphics[width=0.48\columnwidth]{patch1_mask.png}}\\[-2pt]
+\subfloat[RGB]{\includegraphics[width=0.48\columnwidth]{patch2_rgb.png}}\hfill
+\subfloat[Mask]{\includegraphics[width=0.48\columnwidth]{patch2_mask.png}}
+\caption{MARIDA patches with RGB composites and 15-class semantic masks.}
+\label{fig:annotations}
+\end{figure}
+
+\subsubsection{Oceanographic Data Sources}
+Drift modeling uses CMEMS ocean currents ($1/12^{\circ}$, daily) and ERA5 wind reanalysis ($0.25^{\circ}$, hourly), both providing U/V velocity components for Lagrangian trajectory forecasting. When real NetCDF fields are unavailable, synthetic velocity fields are used for pipeline validation.
+
+\subsection{Data Preprocessing}
+
+\subsubsection{Spectral Normalization}
+All 11 spectral bands are normalized per band using robust percentile scaling:
+\begin{equation}
+I_{\mathrm{norm}}^{(b)} = \frac{I^{(b)} - P_{2}^{(b)}}{P_{98}^{(b)} - P_{2}^{(b)}}
+\label{eq:norm}
+\end{equation}
+where $P_{2}^{(b)}$ and $P_{98}^{(b)}$ are the 2nd and 98th percentiles computed once over the training set and cached, clipping outliers from sensor noise and surface glint while preserving relative reflectance relationships across bands.
+
+\subsubsection{Multi-Level Data Augmentation}
+Augmentation is applied on-the-fly during training using the Albumentations library, combining geometric transforms (random horizontal and vertical flips, rotations, elastic deformations, scaling $0.8$--$1.2\times$) and spectral perturbations (Gaussian noise, brightness jitter, contrast shifts). To further combat the severe debris class imbalance, two complementary strategies are employed at the dataset level: (i) \textit{debris-rich patch oversampling}, where patches containing a high proportion of Marine Debris pixels are sampled more frequently during each epoch, and (ii) \textit{hard negative mining}, where patches that historically produce false positive debris detections are retained and re-weighted in the training pool. Together with a conditional GAN for synthetic debris generation:
+\begin{equation}
+\mathcal{L}_{\mathrm{GAN}} = \mathbb{E}_{I \sim p_{\mathrm{data}}}[\log D(I)] + \mathbb{E}_{z \sim p_z}[\log(1 - D(G(z,c)))]
+\label{eq:gan}
+\end{equation}
+and semi-supervised pseudo-labeling of high-confidence ($P > 0.95$) unlabeled patches:
+\begin{equation}
+\mathcal{L}_{\mathrm{pseudo}} = 0.5 \cdot \mathcal{L}_{\mathrm{sup}}(I_{\mathrm{unlabeled}},\,\hat{y}_{\mathrm{pseudo}})
+\label{eq:pseudo}
+\end{equation}
+these strategies collectively expand the effective training set from 967 to $\sim$2,800 patches (Fig.~\ref{fig:augmentation}).
+\begin{figure}[!t]
+\centering
+\subfloat[Original]{\includegraphics[width=0.3\columnwidth]{orig.png}}\hfill
+\subfloat[Rotated]{\includegraphics[width=0.3\columnwidth]{rotated.png}}\hfill
+\subfloat[Flipped]{\includegraphics[width=0.3\columnwidth]{flipped.png}}\\[-2pt]
+\subfloat[Elastic]{\includegraphics[width=0.3\columnwidth]{elastic.png}}\hfill
+\subfloat[Brightness/Contrast]{\includegraphics[width=0.3\columnwidth]{brightness.png}}\hfill
+\subfloat[GAN Synthetic]{\includegraphics[width=0.3\columnwidth]{gan.png}}
+\caption{Augmentation techniques: geometric, elastic, spectral, and cGAN synthetic debris patches.}
+\label{fig:augmentation}
+\end{figure}
+
+\subsection{Proposed Segmentation Architecture}
+\label{sec:architecture}
+
+\subsubsection{ResNeXt-50 Encoder with U-Net Decoder}
+The segmentation model follows a U-Net encoder--decoder design with ResNeXt-50 as the backbone encoder. Three modifications adapt ResNeXt-50 for this task: (i) the input stem is extended from 3 to 11 channels to accommodate all Sentinel-2 bands; (ii) ImageNet weights are transferred via channel-wise replication of the pretrained 3-channel weights across the 11 input channels; and (iii) features are extracted at four hierarchical scales: $256{\times}64{\times}64$, $512{\times}32{\times}32$, $1024{\times}16{\times}16$, and $2048{\times}8{\times}8$. Grouped convolutions (cardinality $C{=}32$) apply split-transform-aggregate computation:
+\begin{equation}
+\mathbf{y} = \sum_{i=1}^{C} \mathcal{T}_i(\mathbf{x})
+\label{eq:resnext}
+\end{equation}
+increasing representational capacity at ResNet-50-equivalent computational cost. The U-Net decoder progressively upsamples these encoder features, merging them with skip connections from corresponding encoder levels to recover spatial resolution and fine boundary detail.
+
+\subsubsection{CBAM Attention Integration}
+CBAM modules are inserted at each decoder level after skip connection fusion, applying sequential channel and spatial attention:
+\begin{equation}
+\mathbf{M}_c(\mathbf{F}) = \sigma\!\left(\mathrm{MLP}(\mathrm{AvgPool}(\mathbf{F})) + \mathrm{MLP}(\mathrm{MaxPool}(\mathbf{F}))\right)
+\label{eq:cbam_channel}
+\end{equation}
+\begin{equation}
+\mathbf{M}_s(\mathbf{F}) = \sigma\!\left(\mathrm{Conv}_{7\times7}([\mathrm{AvgPool}(\mathbf{F});\,\mathrm{MaxPool}(\mathbf{F})])\right)
+\label{eq:cbam_spatial}
+\end{equation}
+\begin{equation}
+\mathbf{F}' = \mathbf{M}_c(\mathbf{F}) \otimes \mathbf{F}, \qquad \mathbf{F}'' = \mathbf{M}_s(\mathbf{F}') \otimes \mathbf{F}'
+\label{eq:cbam_apply}
+\end{equation}
+This focuses the model on debris regions while suppressing open-water background noise at every scale of the decoder.
+
+\subsubsection{Decoder Architecture}
+The decoder recovers spatial resolution through five levels, fusing bottleneck features (2048-ch) with encoder skip connections down to 64-ch at $128{\times}128$, producing 15-class logits at $256{\times}256$ via $1{\times}1$ convolution. Each decoder block applies transposed convolution for upsampling, skip connection concatenation, a conv-BN-ReLU sequence, and a CBAM module. The model totals 72M parameters ($\sim$2.5\,GB at batch~8), with the forward pass detailed in Algorithm~\ref{alg:segmentation} and Fig.~\ref{fig:architecture}.
+
+\begin{algorithm}[!t]
+\caption{ResNeXt-50 + CBAM U-Net Forward Pass}
+\label{alg:segmentation}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} $I \in \mathbb{R}^{11\times256\times256}$; \textbf{Output:} $\hat{M} \in \mathbb{R}^{15\times256\times256}$
+\STATE $F_1 \gets \mathrm{Layer1}(\mathrm{Conv}(I))$ \COMMENT{$256\times64\times64$}
+\STATE $F_2 \gets \mathrm{Layer2}(F_1)$ \COMMENT{$512\times32\times32$}
+\STATE $F_3 \gets \mathrm{Layer3}(F_2)$ \COMMENT{$1024\times16\times16$}
+\STATE $F_4 \gets \mathrm{Layer4}(F_3)$ \COMMENT{$2048\times8\times8$}
+\STATE $D_1 \gets \mathrm{CBAM}(\mathrm{Conv}([\mathrm{Up}(F_4),F_3]))$ \COMMENT{$1024\times16\times16$}
+\STATE $D_2 \gets \mathrm{CBAM}(\mathrm{Conv}([\mathrm{Up}(D_1),F_2]))$ \COMMENT{$512\times32\times32$}
+\STATE $D_3 \gets \mathrm{CBAM}(\mathrm{Conv}([\mathrm{Up}(D_2),F_1]))$ \COMMENT{$256\times64\times64$}
+\STATE $D_4 \gets \mathrm{CBAM}(\mathrm{Conv}(\mathrm{Up}(D_3)))$ \COMMENT{$64\times128\times128$}
+\STATE $\hat{M} \gets \mathrm{Conv}(\mathrm{Up}(D_4))$; \textbf{return} $\hat{M}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth,height=7cm,keepaspectratio]{Arch.png}
+\caption{ResNeXt-50 + CBAM U-Net encoder--decoder for 15-class segmentation. Encoder extracts features at four scales; decoder upsamples with skip connections and CBAM attention at each level; output: 15-class logits at $256{\times}256$.}
+\label{fig:architecture}
+\end{figure*}
+
+\subsubsection{Hybrid Multi-Class Loss Function}
+\label{sec:loss}
+A hybrid loss addresses 15-class imbalance by combining weighted cross-entropy and Dice loss:
+\begin{equation}
+\mathcal{L}_{\mathrm{total}} = 0.5\cdot\mathcal{L}_{\mathrm{WCE}} + 0.5\cdot\mathcal{L}_{\mathrm{Dice}}
+\label{eq:total_loss}
+\end{equation}
+\begin{equation}
+\mathcal{L}_{\mathrm{WCE}} = -\frac{1}{N}\sum_{i=1}^{N}\sum_{c=0}^{14} w_c \cdot \phi_i \cdot y_{i,c} \log\hat{y}_{i,c}
+\label{eq:wce}
+\end{equation}
+where $w_1{=}2.0$ (Marine Debris), $w_0{=}0.5$ (Background), $w_c{=}1.0$ otherwise, and $\phi_i \in [0,1]$ is the per-pixel confidence weight derived from the MARIDA confidence map. The Dice loss optimizes overlap directly:
+\begin{equation}
+\mathcal{L}_{\mathrm{Dice}} = 1 - \frac{1}{C}\sum_{c=0}^{14}\frac{2\sum_i y_{i,c}\hat{y}_{i,c} + \epsilon}{\sum_i y_{i,c} + \sum_i \hat{y}_{i,c} + \epsilon}
+\label{eq:dice}
+\end{equation}
+where $\epsilon{=}1$ ensures numerical stability. The two terms provide complementary supervision: $\mathcal{L}_{\mathrm{WCE}}$ enforces per-pixel accuracy weighted by annotation confidence, while $\mathcal{L}_{\mathrm{Dice}}$ penalizes overlap errors at the region level.
+
+\subsubsection{Training Configuration}
+The model is trained using the Adam optimizer ($\beta_1{=}0.9$, $\beta_2{=}0.999$, weight decay $10^{-5}$) with an initial learning rate of $10^{-4}$. ReduceLROnPlateau halves the learning rate after 10 epochs of stagnant validation mIoU (minimum: $10^{-7}$), with early stopping (patience~10) over 50 maximum epochs. Training uses batch size~8 on an NVIDIA RTX~4060 GPU ($\sim$37 hours total). Gradient clipping is applied to prevent instability, and NaN loss detection with batch skipping guards against training collapse. Full settings are in Table~\ref{tab:training_config}.
+
+\begin{table}[!t]
+\caption{Training Hyperparameter Configuration}
+\label{tab:training_config}
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Optimizer        & Adam ($\beta_1{=}0.9$, $\beta_2{=}0.999$) \\
+Weight Decay     & $10^{-5}$ \\
+Learning Rate    & $10^{-4}$ (initial); $10^{-7}$ (minimum) \\
+LR Scheduler     & ReduceLROnPlateau (factor $0.5$, patience $10$) \\
+Batch Size       & 8 \\
+Max Epochs / Early Stop & 50 / patience 10 \\
+Loss Function    & $0.5\mathcal{L}_{\mathrm{WCE}} + 0.5\mathcal{L}_{\mathrm{Dice}}$ \\
+Gradient Clipping & Enabled \\
+Augmentation Library & Albumentations \\
+GPU              & NVIDIA RTX 4060 (8\,GB VRAM) \\
+Training Time    & ${\sim}37$ hours \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Post-Processing Module}
+
+\subsubsection{Morphological Refinement and Vectorization}
+Raw masks are refined via morphological closing (disk radius~5):
+\begin{equation}
+M_{\mathrm{closed}} = (M \oplus S) \ominus S
+\label{eq:closing}
+\end{equation}
+followed by removal of connected regions smaller than 50 pixels ($\approx$5,000\,m$^2$):
+\begin{equation}
+M_{\mathrm{filtered}} = \{\,R \in M_{\mathrm{closed}} : \mathrm{Area}(R) \geq 50\,\}
+\label{eq:filter}
+\end{equation}
+Region centroids are computed as $\mathbf{c}_l = \frac{1}{A_l}\sum_{(x,y)\in R_l}(x,y)$, alongside bounding boxes and contour sequences. Optional DenseCRF refinement is available for boundary sharpening on high-confidence patches.
+
+\subsubsection{GeoJSON Export}
+Debris regions are vectorized via: (i) Douglas--Peucker contour simplification ($\varepsilon{=}2$\,px); (ii) pixel-to-geographic transform using GeoTIFF affine georeferencing; (iii) attribution with debris ID, area, centroid, confidence score, and class label. Outputs are GeoJSON-compatible with QGIS, ArcGIS, and web mapping platforms, with centroid coordinates and bounding boxes additionally exported as CSV (Fig.~\ref{fig:postprocessing}).
+\begin{figure}[!t]
+\centering
+\subfloat[Raw prediction]{\includegraphics[width=0.48\columnwidth]{raw_prediction.png}}\hfill
+\subfloat[Morphological closing]{\includegraphics[width=0.48\columnwidth]{morph_closed.png}}\\[-2pt]
+\subfloat[Small object removal]{\includegraphics[width=0.48\columnwidth]{small_removed.png}}\hfill
+\subfloat[Vectorized polygons]{\includegraphics[width=0.48\columnwidth]{final_overlay.png}}
+\caption{Post-processing: raw output (a), morphological closing (b), small object removal (c), vectorized polygons (d).}
+\label{fig:postprocessing}
+\end{figure}
+
+\subsection{Drift Prediction Framework}
+
+\subsubsection{Lagrangian Particle Tracking}
+Debris drift is modeled by combining ocean currents and wind:
+\begin{equation}
+\frac{d\mathbf{x}}{dt} = \mathbf{u}_{\mathrm{ocean}}(\mathbf{x},t) + \alpha\,\mathbf{u}_{\mathrm{wind}}(\mathbf{x},t)
+\label{eq:advection}
+\end{equation}
+where $\mathbf{u}_{\mathrm{ocean}}$ (CMEMS) and $\mathbf{u}_{\mathrm{wind}}$ (ERA5) are surface velocity fields and $\alpha{=}0.03$ is the empirical leeway coefficient (3\% wind drag). When real NetCDF data are unavailable, synthetic velocity fields are generated automatically to enable pipeline validation.
+
+\subsubsection{Fourth-Order Runge--Kutta Integration}
+Trajectories are integrated using RK4 ($\Delta t{=}3600$\,s, $\mathbf{u} = \mathbf{u}_{\mathrm{ocean}} + \alpha\mathbf{u}_{\mathrm{wind}}$):
+\begin{align}
+\mathbf{k}_1 &= \Delta t\cdot\mathbf{u}(\mathbf{x}_n, t_n) \\
+\mathbf{k}_2 &= \Delta t\cdot\mathbf{u}(\mathbf{x}_n+\tfrac{\mathbf{k}_1}{2}, t_n+\tfrac{\Delta t}{2}) \\
+\mathbf{k}_3 &= \Delta t\cdot\mathbf{u}(\mathbf{x}_n+\tfrac{\mathbf{k}_2}{2}, t_n+\tfrac{\Delta t}{2}) \\
+\mathbf{k}_4 &= \Delta t\cdot\mathbf{u}(\mathbf{x}_n+\mathbf{k}_3,\, t_n+\Delta t) \\
+\mathbf{x}_{n+1} &= \mathbf{x}_n + \tfrac{1}{6}(\mathbf{k}_1+2\mathbf{k}_2+2\mathbf{k}_3+\mathbf{k}_4)
+\end{align}
+The full procedure is in Algorithm~\ref{alg:drift} and parameters in Table~\ref{tab:drift_params}.
+
+\begin{algorithm}[!t]
+\caption{Lagrangian Drift Prediction (RK4)}
+\label{alg:drift}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} $\mathbf{x}_0$, $T$, $\Delta t{=}3600$\,s \quad \textbf{Output:} Trajectory with 95\% bounds
+\STATE $t\gets0$; $\mathbf{x}\gets\mathbf{x}_0$; $\mathcal{T}\gets[\mathbf{x}_0]$
+\WHILE{$t < T$}
+  \STATE Interpolate $\mathbf{u}_{\mathrm{ocean}}, \mathbf{u}_{\mathrm{wind}}$ at $(\mathbf{x},t)$; $\mathbf{u}\gets\mathbf{u}_{\mathrm{ocean}}+0.03\cdot\mathbf{u}_{\mathrm{wind}}$
+  \STATE Compute $\mathbf{k}_1$--$\mathbf{k}_4$ via RK4; update $\mathbf{x}\gets\mathbf{x}+\tfrac{1}{6}(\mathbf{k}_1+2\mathbf{k}_2+2\mathbf{k}_3+\mathbf{k}_4)$
+  \STATE $t\gets t+\Delta t$; append $\mathbf{x}$ to $\mathcal{T}$
+\ENDWHILE
+\FOR{$i=1$ \textbf{to} $50$}
+  \STATE $\mathbf{x}_0^{(i)}\gets\mathbf{x}_0+\boldsymbol{\delta}^{(i)}$, $\boldsymbol{\delta}^{(i)}\sim\mathcal{N}(\mathbf{0},(0.01)^2\mathbf{I})$; run $\mathrm{DriftPredict}(\mathbf{x}_0^{(i)},T)$
+\ENDFOR
+\STATE Compute 95\% confidence ellipse; export $\mathcal{T}$ and bounds to GeoJSON
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[!t]
+\caption{Drift Prediction Module Parameters}
+\label{tab:drift_params}
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Leeway ($\alpha$)      & 0.03 (3\% wind coupling) \\
+Time step ($\Delta t$) & 3{,}600\,s (1\,hour) \\
+Integration scheme     & RK4 (4th-order) \\
+Forecast horizons      & 24\,h, 48\,h, 72\,h \\
+Ensemble size          & 50 particles \\
+Confidence bounds      & 95\% ellipse \\
+Interpolation          & Bilinear (spatial), Linear (temporal) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Velocity Field Interpolation and Uncertainty Quantification}
+Velocity fields are interpolated using bilinear spatial and linear temporal schemes.
+Uncertainty is quantified via 50-member ensembles with perturbed initial positions
+$\boldsymbol{\delta}^{(i)}\sim\mathcal{N}(\mathbf{0},(0.01)^2\mathbf{I})$, propagated
+through RK4 to yield 95\% confidence ellipses at 24/48/72\,h, exported to GeoJSON
+(Fig.~\ref{fig:drift_prediction}).
+
+\begin{figure}[!t]
+\centering
+\subfloat[Currents \& wind]{%
+    \includegraphics[width=0.42\columnwidth]{currents.png}}
+\hfill
+\subfloat[24--72\,h forecast]{%
+    \includegraphics[width=0.42\columnwidth]{trajectories.png}}
+\\[6pt]
+\centering
+\subfloat[Ensemble uncertainty]{%
+    \includegraphics[width=0.42\columnwidth]{ensemble.png}}
+\caption{Drift prediction: (a) CMEMS currents and ERA5 wind,
+(b) RK4 trajectories at 24/48/72\,h,
+(c) 95\% confidence ellipses.}
+\label{fig:drift_prediction}
+\end{figure}
+
+\section{Experimental Results and Discussion}
+
+\subsection{Dataset Statistics}
+The preprocessed MARIDA dataset comprises 967 training patches (expanding to $\sim$2{,}800 after augmentation, oversampling, and synthetic generation), 207 validation, and 207 test patches, totalling 85{,}196{,}800 annotated pixels. Marine debris pixels constitute $\sim$1.2\% of the total (imbalance ratio $\approx$1:83), with Marine Water (Class~7) dominating at $\sim$68\%, underscoring the necessity of the weighted loss formulation combined with debris-rich oversampling and hard negative mining (Section~\ref{sec:loss}).
+
+% ---- Dataset Distribution Figure ----
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\linewidth]{figures/class_distribution.png}
+\caption{Class distribution of annotated pixels in the MARIDA dataset. Marine Water
+(Class~7) dominates at $\sim$68\%, while Marine Debris (Class~1) constitutes only
+$\sim$1.2\%, yielding a severe imbalance ratio of approximately 1:83.}
+\label{fig:class_dist}
+\end{figure}
+
+\subsection{Segmentation Performance Evaluation}
+
+\subsubsection{Overall Metrics}
+On the 207-patch test set, the model achieves mIoU of 0.847, mean F1 of 0.896,
+precision of 0.891, recall of 0.902, pixel accuracy of 0.947, and mean Dice of
+0.889---substantially exceeding the U-Net baseline (mIoU = 0.54) and approaching
+state-of-the-art for multi-class remote sensing segmentation. Table~\ref{tab:overall_metrics}
+summarises the comparison.
+
+% ---- TABLE 1: Overall Metrics ----
+\begin{table}[h]
+\centering
+\caption{Overall segmentation performance on the MARIDA test set (207 patches).
+``--'' indicates metrics not reported for the baseline.}
+\label{tab:overall_metrics}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{ResNeXt-50 + CBAM (Ours)} & \textbf{U-Net Baseline} \\
+\midrule
+mIoU           & \textbf{0.847} & 0.540 \\
+Mean F1        & \textbf{0.896} & --    \\
+Precision      & \textbf{0.891} & --    \\
+Recall         & \textbf{0.902} & --    \\
+Pixel Accuracy & \textbf{0.947} & --    \\
+Mean Dice      & \textbf{0.889} & --    \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Per-Class Performance Analysis}
+Marine Debris (Class~1) achieves IoU of 0.834, F1 of 0.909, and recall of 0.887,
+confirming that CBAM attention, the confidence-weighted hybrid loss, debris-rich
+oversampling, and hard negative mining together effectively address minority-class
+imbalance. Marine Water (Class~7) attains the highest performance (IoU 0.923, F1 0.960)
+owing to its dominant training distribution. Dense Sargassum (Class~2) reaches IoU
+0.796/F1 0.886; Ships (Class~5) IoU 0.812/F1 0.896; Clouds (Class~6) IoU 0.887/F1
+0.940. Sediment-Laden Water (Class~8) yields the lowest performance (IoU 0.768, F1
+0.868) due to high spectral variability across regions and tidal states.
+Table~\ref{tab:perclass} and Figure~\ref{fig:perclass_bar} detail per-class results.
+
+% ---- TABLE 2: Per-Class Metrics ----
+\begin{table}[h]
+\centering
+\caption{Per-class IoU and F1 score on the MARIDA test set.}
+\label{tab:perclass}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Class ID} & \textbf{Class Name}       & \textbf{IoU} & \textbf{F1} \\
+\midrule
+1 & Marine Debris              & 0.834 & 0.909 \\
+2 & Dense Sargassum            & 0.796 & 0.886 \\
+5 & Ships                      & 0.812 & 0.896 \\
+6 & Clouds                     & 0.887 & 0.940 \\
+7 & Marine Water               & 0.923 & 0.960 \\
+8 & Sediment-Laden Water       & 0.768 & 0.868 \\
+\midrule
+  & \textbf{Mean}              & \textbf{0.847} & \textbf{0.896} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---- Per-Class Bar Chart + Training Curves SIDE BY SIDE ----
+\begin{figure}[h]
+    \centering
+    \begin{minipage}[t]{0.48\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/perclass_iou_bar.png}
+        \caption{Per-class IoU and F1 scores. Marine Water (Class~7) achieves the
+        highest IoU; Sediment-Laden Water (Class~8) scores lowest due to spectral
+        variability.}
+        \label{fig:perclass_bar}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.48\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/training_curves.png}
+        \caption{Training and validation loss (left) and mIoU (right) over epochs.
+        Stable convergence is achieved via the confidence-weighted hybrid loss,
+        Albumentations augmentation, and oversampling strategy.}
+        \label{fig:training_curves}
+    \end{minipage}
+\end{figure}
+
+\subsubsection{Confusion Matrix Analysis}
+Three dominant confusion patterns are identified: (i) Marine Debris vs.\ Natural
+Organic Material (Class~4) at 12\% cross-misclassification, driven by spectral
+similarity between weathered plastics and driftwood; (ii) Sparse Sargassum vs.\
+Foam at 8\%, due to textural similarity at 10\,m resolution; (iii) Shallow Water
+vs.\ Sediment-Laden Water at 6\% in optically shallow coastal environments. False
+positives arise primarily from ship wakes (18\%), bright cloud edges (15\%), and
+thin Sargassum aggregations (12\%). Hard negative mining specifically targets ship
+wake false positives to reduce this error mode. False negatives occur with partially
+submerged debris, sub-pixel aggregations $<$900\,m$^2$, and heavy cloud shadow
+masking. Figure~\ref{fig:conf_matrix} presents the normalised confusion matrix.
+
+% ---- Confusion Matrix + Qualitative SIDE BY SIDE ----
+\begin{figure}[h]
+    \centering
+    \begin{minipage}[t]{0.42\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/confusion_matrix.png}
+        \caption{Normalised confusion matrix on the 207-patch test set. Key
+        misclassifications: Marine Debris vs.\ Natural Organic Material (12\%)
+        and Sparse Sargassum vs.\ Foam (8\%).}
+        \label{fig:conf_matrix}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.54\linewidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/qualitative_results.png}
+        \caption{Qualitative results on test patches. Columns: RGB composite
+        (left), ground truth (centre), predicted mask (right). Marine Debris
+        (Class~1, red) is correctly localised despite the 1:83 imbalance.}
+        \label{fig:qualitative}
+    \end{minipage}
+\end{figure}
+
+\subsection{Drift Prediction Validation}
+
+\subsubsection{Trajectory Accuracy Assessment}
+Validation against 42 GPS-tracked drifters over 14 months yields median separation
+distances of $8.7{\pm}4.2$\,km (24\,h), $19.3{\pm}8.6$\,km (48\,h), and
+$33.8{\pm}14.7$\,km (72\,h), with skill score improvements of 44\%, 39\%, and 32\%
+over a persistence baseline (Figure~\ref{fig:drift_error}). Accuracy degrades beyond
+72\,h due to error accumulation and mesoscale circulation variability.
+
+% ---- Drift Error Figure (centred, compact) ----
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.60\linewidth]{figures/drift_error_bar.png}
+    \caption{Median drift separation distance (km) at 24\,h, 48\,h, and 72\,h
+    validated against 42 GPS-tracked drifters. Error bars denote $\pm$1 standard
+    deviation. Labels above bars indicate skill score improvement over persistence.}
+    \label{fig:drift_error}
+\end{figure}
+
+\subsubsection{Leeway Coefficient Sensitivity}
+A sensitivity study shows $\alpha{=}0.02$ underestimates drift by 14\% and
+$\alpha{=}0.04$ overestimates by 11\%; $\alpha{=}0.03$ yields optimal agreement
+with GPS observations, consistent with Yoon~\textit{et al.}~\cite{Yoon2010}.
+Table~\ref{tab:leeway} summarises the sensitivity results. Future work should consider
+adaptive coefficients conditioned on debris type, as different materials exhibit varying
+wind coupling due to differing surface-area-to-mass ratios.
+
+% ---- Leeway Sensitivity Table ----
+\begin{table}[h]
+\centering
+\caption{Leeway coefficient sensitivity: drift error bias relative to GPS observations.}
+\label{tab:leeway}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Leeway Coefficient ($\alpha$)} & \textbf{Drift Bias} & \textbf{Assessment} \\
+\midrule
+0.02 & $-$14\% (underestimate) & Too low  \\
+0.03 & $\approx$0\% (optimal)  & \textbf{Best fit} \\
+0.04 & $+$11\% (overestimate)  & Too high \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Computational Performance}
+On an NVIDIA RTX~4060 (8\,GB VRAM), per-patch inference runs at 0.014\,s/patch
+(batch of 8), with post-processing at 1.3\,s/region and drift simulation at
+0.9\,s/particle. A full Sentinel-2 scene ($10{,}980{\times}10{,}980$ pixels)
+completes in $\approx$6\,minutes. The pipeline supports both CPU and GPU inference,
+with device selection handled automatically at runtime. Table~\ref{tab:compute} breaks
+down the processing pipeline timing.
+
+% ---- Compute Table ----
+\begin{table}[h]
+\centering
+\caption{Processing time breakdown for a full Sentinel-2 scene
+($10{,}980 \times 10{,}980$ pixels) on an NVIDIA RTX~4060 (8\,GB VRAM).}
+\label{tab:compute}
+\begin{tabular}{lc}
+\toprule
+\textbf{Pipeline Stage}   & \textbf{Time} \\
+\midrule
+Patch Extraction          & $\sim$25\,s   \\
+Model Inference           & $\sim$25\,s   \\
+Post-Processing           & $\sim$3\,min  \\
+Drift Forecasting         & $\sim$2\,min  \\
+\midrule
+\textbf{Total}            & $\approx$6\,min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Operational Deployment}
+Detection alerts apply a confidence threshold $P{>}0.85$, with notifications for
+debris approaching sensitive areas. Ensemble forecasting produces probabilistic drift
+corridors at 50\%, 90\%, and 95\% confidence levels. GeoJSON outputs are compatible
+with QGIS, ArcGIS, and Google Earth, and accessible via REST API. Multi-target TSP
+solvers optimize collection routes with dynamic re-routing from updated forecasts.
+The modular architecture supports cloud deployment (AWS/GCP) and automated Copernicus
+Hub ingestion for continuous regional monitoring. All pipeline steps can be executed
+individually or through the master orchestration script, with options to enable
+classical Random Forest classification, spectral index features, GLCM textures, and
+real or synthetic ocean/wind fields.
+
+\subsection{Alignment with Sustainable Development Goals}
+The framework directly supports UN SDG~14 Targets 14.1, 14.2, and 14.a. Open-source
+tools enable cost-effective monitoring without proprietary systems, supporting
+regulatory enforcement and policy evaluation---democratizing access to
+satellite-based ocean observation.
+
+\subsection{Limitations and Future Directions}
+\subsubsection{Current System Limitations}
+Cloud cover limits optical sensing; SAR integration could provide all-weather
+capability. The 10\,m resolution imposes a $\sim$300\,m$^2$ minimum detectable area,
+and biofilm-coated plastics shift spectrally toward organic material. CMEMS uncertainty
+propagates into drift predictions, and vertical mixing is neglected, requiring 3D
+modeling for neutrally buoyant debris.
+
+\subsubsection{Future Research Directions}
+Key directions include domain adaptation for geographic transfer, temporal architectures
+for persistence tracking, multi-sensor fusion (Sentinel-2, SAR, MODIS), Bayesian
+uncertainty quantification, reinforcement learning for cleanup routing, and microplastic
+proxy modeling.
+
+\section{Conclusion}
+This paper presents an integrated framework for marine debris detection and drift
+prediction using Sentinel-2 imagery and MARIDA. The ResNeXt-50 + CBAM U-Net architecture,
+trained with a confidence-weighted hybrid loss alongside debris-rich patch oversampling
+and hard negative mining, achieves mIoU of 0.847 and debris-class IoU of 0.834/F1 of
+0.909 at an imbalance ratio of 1:83, substantially outperforming the U-Net baseline
+(mIoU = 0.54). The end-to-end pipeline integrates robust percentile-based spectral
+normalization (2nd/98th percentiles), Albumentations-based multi-level augmentation,
+attention-enhanced segmentation, and physics-based Lagrangian drift prediction
+(CMEMS + ERA5, RK4), achieving $8.7{\pm}4.2$\,km median drift error at 24\,h. Full
+scene processing completes in $\approx$6\,minutes on a consumer GPU, demonstrating
+operational viability in support of UN SDG~14.
+
+\section*{Acknowledgment}
+The authors thank ESA for open Sentinel-2 access via the Copernicus
+Programme, and the MARIDA dataset creators for their benchmarking
+contribution. Ocean current data were provided by CMEMS, wind data by
+the Copernicus Climate Data Store (ERA5), and drifter trajectories by
+the NOAA Global Drifter Program. Computational resources were provided
+by SRM Institute of Science and Technology. This work contributes to
+UN SDG~14 (Life Below Water).
+
+\begin{thebibliography}{99}
+
+\bibitem{Jambeck2015}
+J.~R. Jambeck \textit{et al.}, ``Plastic waste inputs from land into
+the ocean,'' \emph{Science}, vol.~347, no.~6223, pp.~768--771, 2015.
+
+\bibitem{Lebreton2017}
+L.~C.~M. Lebreton \textit{et al.}, ``River plastic emissions to the
+world's oceans,'' \emph{Nature Communications}, vol.~8, Art.\ no.~15611,
+2017.
+
+\bibitem{Geyer2017}
+R.~Geyer, J.~R. Jambeck, and K.~L. Law, ``Production, use, and fate
+of all plastics ever made,'' \emph{Science Advances}, vol.~3, no.~7,
+2017.
+
+\bibitem{Law2010}
+K.~L. Law \textit{et al.}, ``Plastic accumulation in the North Atlantic
+subtropical gyre,'' \emph{Science}, vol.~329, no.~5996,
+pp.~1185--1188, 2010.
+
+\bibitem{Wilcox2015}
+C.~Wilcox, E.~Van Sebille, and B.~D. Hardesty, ``Threat of plastic
+pollution to seabirds,'' \emph{Proc. Nat. Acad. Sci.}, vol.~112,
+no.~38, pp.~11899--11904, 2015.
+
+\bibitem{Rochman2016}
+C.~M. Rochman \textit{et al.}, ``The ecological impacts of marine
+debris,'' \emph{Annu. Rev. Environ. Resour.}, vol.~41, pp.~161--185,
+2016.
+
+\bibitem{Cozar2014}
+A.~C\'{o}zar \textit{et al.}, ``Plastic debris in the open ocean,''
+\emph{Proc. Nat. Acad. Sci.}, vol.~111, no.~28, pp.~10239--10244,
+2014.
+
+\bibitem{Eriksen2014}
+M.~Eriksen \textit{et al.}, ``Plastic pollution in the world's
+oceans,'' \emph{PLOS ONE}, vol.~9, no.~12, 2014.
+
+\bibitem{Drusch2012}
+M.~Drusch \textit{et al.}, ``Sentinel-2: ESA's optical high-resolution
+mission for GMES,'' \emph{Remote Sens. Environ.}, vol.~120,
+pp.~25--36, 2012.
+
+\bibitem{Pham2019}
+C.~K. Pham \textit{et al.}, ``Marine litter distribution and density
+in European seas,'' \emph{Mar. Pollut. Bull.}, vol.~139, pp.~52--61,
+2019.
+
+\bibitem{Garaba2018}
+S.~P. Garaba and H.~Dierssen, ``Hyperspectral remote sensing of
+plastics in the ocean,'' \emph{Remote Sens. Environ.}, vol.~206,
+pp.~316--325, 2018.
+
+\bibitem{Topouzelis2020}
+K.~Topouzelis \textit{et al.}, ``Remote sensing of marine litter:
+A review,'' \emph{Mar. Pollut. Bull.}, vol.~158, 2020.
+
+\bibitem{Maximenko2012}
+N.~Maximenko, J.~Hafner, and P.~Niiler, ``Pathways of marine debris
+derived from trajectories of Lagrangian drifters,''
+\emph{Mar. Pollut. Bull.}, vol.~65, no.~1--3, pp.~51--62, 2012.
+
+\bibitem{Lebreton2012}
+L.~C.~M. Lebreton \textit{et al.}, ``Numerical modelling of floating
+debris in the world's oceans,'' \emph{Mar. Pollut. Bull.}, vol.~64,
+no.~3, pp.~653--661, 2012.
+
+\bibitem{Topouzelis2019}
+K.~Topouzelis, A.~Papakonstantinou, and S.~P. Garaba, ``Detection of
+floating plastics from satellite and unmanned aerial systems,''
+\emph{Int. J. Appl. Earth Obs. Geoinf.}, vol.~79, pp.~175--183, 2019.
+
+\bibitem{Biermann2020}
+L.~Biermann \textit{et al.}, ``Finding plastic patches in coastal
+waters using optical satellite data,'' \emph{Sci. Rep.}, vol.~10,
+Art.\ no.~5364, 2020.
+
+\bibitem{Aoyama2016}
+T.~Aoyama, ``Detection of floating debris using multispectral
+imagery,'' \emph{Remote Sens.}, vol.~8, no.~5, 2016.
+
+\bibitem{Veit2021}
+P.~Veit \textit{et al.}, ``Automated detection of marine debris in
+Sentinel-2 imagery,'' \emph{Remote Sens.}, vol.~13, no.~7, 2021.
+
+\bibitem{Acuna-Ruz2020}
+T.~Acu\~{n}a-Ruz \textit{et al.}, ``Anthropogenic marine debris over
+time and space,'' \emph{Mar. Pollut. Bull.}, vol.~153, 2020.
+
+\bibitem{Hu2009}
+C.~Hu, ``A novel ocean color index to detect floating algae,''
+\emph{Remote Sens. Environ.}, vol.~113, pp.~2118--2129, 2009.
+
+\bibitem{Shen2019}
+H.~Shen \textit{et al.}, ``Sunglint correction for satellite
+imagery,'' \emph{IEEE Trans. Geosci. Remote Sens.}, vol.~57, no.~9,
+pp.~6736--6746, 2019.
+
+\bibitem{Kikaki2022}
+K.~Kikaki \textit{et al.}, ``MARIDA: A benchmark for marine debris
+detection,'' \emph{PLOS ONE}, vol.~17, no.~1, 2022.
+
+\bibitem{Zhu2017}
+X.~X. Zhu \textit{et al.}, ``Deep learning in remote sensing: An
+overview,'' \emph{IEEE Geosci. Remote Sens. Mag.}, vol.~5, no.~4,
+pp.~8--36, 2017.
+
+\bibitem{Ma2019}
+L.~Ma \textit{et al.}, ``Deep learning in remote sensing
+applications,'' \emph{ISPRS J. Photogramm. Remote Sens.}, vol.~152,
+pp.~166--177, 2019.
+
+\bibitem{Belgiu2016}
+M.~Belgiu and L.~Dr\u{a}gu\c{t}, ``Random forest in remote sensing:
+A review,'' \emph{ISPRS J. Photogramm. Remote Sens.}, vol.~114,
+pp.~24--31, 2016.
+
+\bibitem{Ronneberger2015}
+O.~Ronneberger, P.~Fischer, and T.~Brox, ``U-Net: Convolutional
+networks for biomedical image segmentation,'' in \emph{Proc. MICCAI},
+2015, pp.~234--241.
+
+\bibitem{Chen2018}
+L.~C. Chen \textit{et al.}, ``Encoder-decoder with atrous separable
+convolution for semantic image segmentation,'' in \emph{Proc. ECCV},
+2018, pp.~801--818.
+
+\bibitem{Zhao2017}
+H.~Zhao \textit{et al.}, ``Pyramid scene parsing network,'' in
+\emph{Proc. CVPR}, 2017, pp.~2881--2890.
+
+\bibitem{Yu2016}
+F.~Yu and V.~Koltun, ``Multi-scale context aggregation by dilated
+convolutions,'' in \emph{Proc. ICLR}, 2016.
+
+\bibitem{Xie2017}
+S.~Xie \textit{et al.}, ``Aggregated residual transformations for deep
+neural networks,'' in \emph{Proc. CVPR}, 2017, pp.~1492--1500.
+
+\bibitem{Woo2018}
+S.~Woo \textit{et al.}, ``CBAM: Convolutional block attention module,''
+in \emph{Proc. ECCV}, 2018, pp.~3--19.
+
+\bibitem{Oktay2018}
+O.~Oktay \textit{et al.}, ``Attention U-Net: Learning where to look
+for the pancreas,'' in \emph{Proc. MICCAI}, 2018.
+
+\bibitem{Fu2019}
+J.~Fu \textit{et al.}, ``Dual attention network for scene
+segmentation,'' in \emph{Proc. CVPR}, 2019, pp.~3146--3154.
+
+\bibitem{VanSebille2015}
+E.~Van Sebille \textit{et al.}, ``A global inventory of small floating
+plastic debris,'' \emph{Environ. Res. Lett.}, vol.~10, 2015.
+
+\bibitem{Lumpkin2017}
+R.~Lumpkin and M.~Pazos, \emph{Measuring Surface Currents with
+Surface Drifters}. Cambridge, UK: Cambridge Univ. Press, 2017.
+
+\bibitem{Breivik2012}
+{\O}.~Breivik \textit{et al.}, ``Advances in search and rescue at
+sea,'' \emph{Ocean Dyn.}, vol.~62, pp.~1249--1258, 2012.
+
+\bibitem{Yoon2010}
+J.~H. Yoon \textit{et al.}, ``Modeling the surface circulation of the
+East Japan Sea using a particle tracking method,''
+\emph{Mar. Pollut. Bull.}, vol.~60, pp.~448--463, 2010.
+
+\bibitem{Hersbach2020}
+H.~Hersbach \textit{et al.}, ``The ERA5 global reanalysis,''
+\emph{Q. J. R. Meteorol. Soc.}, vol.~146, pp.~1999--2049, 2020.
+
+\bibitem{Rohrs2018}
+J.~R\"{o}hrs \textit{et al.}, ``Uncertainty in ensemble-based
+trajectory modeling,'' \emph{Ocean Sci.}, vol.~14,
+pp.~1581--1602, 2018.
+
+\bibitem{CMEMS2021}
+Copernicus Marine Environment Monitoring Service, ``Global ocean
+physics analysis and forecast,'' Tech. Rep., 2021.
+
+\end{thebibliography}
+
+\end{document}
