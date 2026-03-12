@@ -172,32 +172,121 @@ class ResNeXtCBAMUNet(nn.Module):
 
 # ── Loss ─────────────────────────────────────────────────────────────────────
 
+# ── Lovász-Softmax (better IoU surrogate than Dice) ─────────────────────────
+
+def _lovasz_grad(gt_sorted):
+    """Compute gradient of the Lovász extension w.r.t sorted errors.
+    Ref: Berman et al., "The Lovász-Softmax loss" (CVPR 2018)."""
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+def _lovasz_softmax_flat(probas, labels, classes='present'):
+    """Multi-class Lovász-Softmax loss on flattened tensors.
+    probas: [P, C] softmax probabilities, labels: [P] ground truth."""
+    if probas.numel() == 0:
+        return probas * 0.0
+    C = probas.size(1)
+    losses = []
+    class_to_sum = list(range(C)) if classes in ('all', 'present') else classes
+    for c in class_to_sum:
+        fg = (labels == c).float()
+        if classes == 'present' and fg.sum() == 0:
+            continue
+        fg_class = probas[:, c]
+        errors = (fg - fg_class).abs()
+        errors_sorted, perm = torch.sort(errors, 0, descending=True)
+        fg_sorted = fg[perm.data]
+        losses.append(torch.dot(errors_sorted, _lovasz_grad(fg_sorted)))
+    if losses:
+        return torch.stack(losses).mean()
+    return torch.tensor(0.0, device=probas.device, requires_grad=True)
+
+
+def lovasz_softmax(probas, labels, classes='present', ignore_index=-1):
+    """Multi-class Lovász-Softmax loss for 4D tensors (B,C,H,W)."""
+    B, C, H, W = probas.shape
+    probas = probas.permute(0, 2, 3, 1).contiguous().view(-1, C)
+    labels = labels.view(-1)
+    if ignore_index is not None:
+        valid = labels != ignore_index
+        probas = probas[valid]
+        labels = labels[valid]
+    return _lovasz_softmax_flat(probas, labels, classes=classes)
+
+
 class HybridLoss(nn.Module):
     """
-    Weighted Cross-Entropy + Dice loss.
+    Weighted Focal-CE + Lovász-Softmax + Dice loss + Boundary-aware auxiliary.
     Supports per-pixel confidence weights and ignores index -1 (nodata).
+    Lovász directly optimises IoU; Dice provides overlap gradient; Focal-CE handles hard examples.
+    Boundary term sharpens edges of small debris patches.
     """
 
-    def __init__(self, class_weights=None, dice_weight: float = 0.4,
-                 ignore_index: int = -1, use_focal: bool = False, focal_gamma: float = 2.0):
+    def __init__(self, class_weights=None, dice_weight: float = 0.3,
+                 lovasz_weight: float = 0.4, boundary_weight: float = 0.1,
+                 ignore_index: int = -1, use_focal: bool = True,
+                 focal_gamma: float = 2.0, label_smoothing: float = 0.0):
         super().__init__()
         self.class_weights = torch.tensor(class_weights, dtype=torch.float32) if class_weights is not None else None
-        self.dice_w      = dice_weight
-        self.ignore_idx  = ignore_index
-        self.use_focal   = use_focal
-        self.focal_gamma = focal_gamma
-        self.ce = None  # Will be initialized per device
+        self.dice_w       = dice_weight
+        self.lovasz_w     = lovasz_weight
+        self.boundary_w   = boundary_weight
+        self.ce_w         = 1.0 - dice_weight - lovasz_weight - boundary_weight
+        self.ignore_idx   = ignore_index
+        self.use_focal    = use_focal
+        self.focal_gamma  = focal_gamma
+        self.label_smooth = label_smoothing
+
+    @staticmethod
+    def _extract_boundary(mask, ignore_idx=-1):
+        """Extract boundary pixels via morphological dilation - erosion on the debris mask.
+        Returns a float tensor of same shape with 1.0 at boundary pixels."""
+        debris = (mask == 0).float()  # debris class = 0
+        valid = (mask != ignore_idx).float()
+        debris = debris * valid
+        # Use max-pool as dilation and -max_pool(-x) as erosion (3x3 kernel)
+        debris_4d = debris.unsqueeze(1)  # (B,1,H,W)
+        dilated = torch.nn.functional.max_pool2d(debris_4d, kernel_size=3, stride=1, padding=1)
+        eroded  = -torch.nn.functional.max_pool2d(-debris_4d, kernel_size=3, stride=1, padding=1)
+        boundary = ((dilated - eroded) > 0).float().squeeze(1)  # (B,H,W)
+        return boundary * valid
+
+    def _boundary_loss(self, logits, target):
+        """BCE loss on debris probability at boundary pixels."""
+        boundary = self._extract_boundary(target, self.ignore_idx)
+        n_boundary = boundary.sum()
+        if n_boundary < 1:
+            return torch.tensor(0.0, device=logits.device)
+        pred_debris_prob = torch.softmax(logits, dim=1)[:, 0]  # P(debris)
+        gt_debris = ((target == 0) & (target != self.ignore_idx)).float()
+        bce = torch.nn.functional.binary_cross_entropy(
+            pred_debris_prob.clamp(1e-6, 1 - 1e-6), gt_debris, reduction='none'
+        )
+        return (bce * boundary).sum() / (n_boundary + 1e-8)
 
     def _dice(self, pred_soft, target, num_classes):
-        """pred_soft: (B,C,H,W) softmax; target: (B,H,W) long."""
+        """Debris-weighted Dice loss. Debris class gets 2x weight in Dice."""
         eps   = 1e-6
         valid = (target != self.ignore_idx)
-        dice  = 0.0
+        dice_per_class = []
         for c in range(num_classes):
             t = ((target == c) & valid).float()
             p = pred_soft[:, c] * valid.float()
-            dice += (2 * (p * t).sum() + eps) / (p.sum() + t.sum() + eps)
-        return 1.0 - dice / num_classes
+            dice_score = (2 * (p * t).sum() + eps) / (p.sum() + t.sum() + eps)
+            dice_per_class.append(dice_score)
+        # Weight debris class (c=0) more heavily in dice
+        if num_classes >= 2:
+            weighted_dice = 0.7 * dice_per_class[0] + 0.3 * dice_per_class[1]
+        else:
+            weighted_dice = sum(dice_per_class) / num_classes
+        return 1.0 - weighted_dice
 
     def forward(self, logits, target, conf_weights=None):
         """
@@ -212,27 +301,47 @@ class HybridLoss(nn.Module):
             weights = None
 
         # ── Valid-pixel mask (nodata = -1 must not contribute to loss) ──
-        valid_mask = (target != self.ignore_idx).float()           # (B,H,W)
+        valid_mask = (target != self.ignore_idx).float()
         safe_target = target.clone()
-        safe_target[target == self.ignore_idx] = 0                 # placeholder class
+        safe_target[target == self.ignore_idx] = 0
 
-        # Cross-entropy (no ignore_index – we mask manually)
-        ce_fn  = torch.nn.CrossEntropyLoss(weight=weights, reduction="none")
-        ce_map = ce_fn(logits, safe_target)                        # (B,H,W)
+        # ── Focal Cross-Entropy ──
+        ce_fn  = torch.nn.CrossEntropyLoss(
+            weight=weights, reduction="none",
+            label_smoothing=self.label_smooth,
+        )
+        ce_map = ce_fn(logits, safe_target)
 
         if self.use_focal:
             pt = torch.exp(-ce_map)
             ce_map = ((1 - pt) ** self.focal_gamma) * ce_map
 
-        # Zero out nodata, apply confidence weights
         ce_map = ce_map * valid_mask
         if conf_weights is not None:
             ce_map = ce_map * conf_weights
-
-        # Mean over *valid* pixels only
         ce_loss = ce_map.sum() / (valid_mask.sum() + 1e-8)
 
+        # ── Online Hard Example Mining: boost loss on misclassified debris ──
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            debris_mask = (safe_target == 0) & (target != self.ignore_idx)
+            misclassified_debris = debris_mask & (preds != 0)
+            ohem_weight = torch.ones_like(valid_mask)
+            ohem_weight[misclassified_debris] = 3.0  # Extra penalty for missed debris
+        ce_loss_ohem = (ce_map * ohem_weight).sum() / (valid_mask.sum() + 1e-8)
+        ce_loss = 0.5 * ce_loss + 0.5 * ce_loss_ohem
+
+        # ── Softmax probabilities ──
         pred_soft = torch.softmax(logits, dim=1)
+
+        # ── Dice loss (debris-weighted) ──
         dice_loss = self._dice(pred_soft, target, logits.shape[1])
 
-        return (1.0 - self.dice_w) * ce_loss + self.dice_w * dice_loss
+        # ── Lovász-Softmax loss (classes='all' to always optimise debris even when not predicted) ──
+        lovasz_loss = lovasz_softmax(pred_soft, target, classes='all',
+                                     ignore_index=self.ignore_idx)
+
+        # ── Boundary-aware auxiliary loss ──
+        boundary_loss = self._boundary_loss(logits, target) if self.boundary_w > 0 else 0.0
+
+        return self.ce_w * ce_loss + self.dice_w * dice_loss + self.lovasz_w * lovasz_loss + self.boundary_w * boundary_loss

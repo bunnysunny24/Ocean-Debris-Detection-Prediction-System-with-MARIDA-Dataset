@@ -19,12 +19,15 @@ param(
     [switch]$EvalOnly,
     [switch]$TrainOnly,
     [switch]$NoTTA,
-    [int]$Epochs = 120,
-    [int]$Batch = 16,
+    [switch]$MultiScaleTTA,
+    [int]$Epochs = 200,
+    [int]$Batch = 64,
     [double]$LR = 1e-4,
-    [int]$Patience = 30,
+    [int]$Patience = 50,
     [double]$WeightDecay = 5e-5,
-    [int]$Workers = 4,
+    [int]$Workers = 8,
+    [int]$GradAccum = 2,
+    [string]$Encoder = "resnext50_32x4d",
     [string]$Checkpoint = "",
     [string]$OceanNC = "",
     [string]$WindNC = ""
@@ -41,7 +44,8 @@ Write-Host "======================================" -ForegroundColor Cyan
 Write-Host " Marine Debris Detection Pipeline" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host "  Epochs: $Epochs  Batch: $Batch  LR: $LR" -ForegroundColor DarkCyan
-Write-Host "  Patience: $Patience  Workers: $Workers" -ForegroundColor DarkCyan
+Write-Host "  Patience: $Patience  Workers: $Workers  GradAccum: $GradAccum" -ForegroundColor DarkCyan
+Write-Host "  Encoder: $Encoder" -ForegroundColor DarkCyan
 Write-Host ""
 
 # --- Step 1: Train ---
@@ -54,7 +58,9 @@ if (-not $SkipTrain -and -not $EvalOnly) {
         "--lr", $LR,
         "--patience", $Patience,
         "--weight_decay", $WeightDecay,
-        "--workers", $Workers
+        "--workers", $Workers,
+        "--encoder", $Encoder,
+        "--grad_accum", $GradAccum
     )
     if ($Resume) { $trainArgs += "--resume" }
     python @trainArgs
@@ -75,7 +81,11 @@ if ($TrainOnly) {
 # --- Step 2: Evaluate ---
 Write-Host "[2/4] Evaluating on test set..." -ForegroundColor Yellow
 $evalArgs = @("evaluate.py", "--split", "test", "--save_masks", "--threshold", "0.5")
-if (-not $NoTTA) { $evalArgs += "--tta" }
+if ($MultiScaleTTA) {
+    $evalArgs += "--ms_tta"
+} elseif (-not $NoTTA) {
+    $evalArgs += "--tta"
+}
 if ($Checkpoint -ne "") { $evalArgs += @("--ckpt", $Checkpoint) }
 python @evalArgs
 if ($LASTEXITCODE -ne 0) { Write-Host "Evaluation failed!" -ForegroundColor Red; exit 1 }

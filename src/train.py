@@ -8,7 +8,7 @@ Usage:
     python train.py --epochs 80 --batch 4 --lr 5e-5
 """
 
-import os, sys, argparse, time, logging
+import os, sys, argparse, time, logging, copy
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -21,10 +21,38 @@ from configs.config import (
     INPUT_BANDS, NUM_CLASSES, CLASS_WEIGHTS,
     BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, PATIENCE, NUM_WORKERS,
     CHECKPOINTS_DIR, LOGS_DIR,
+    ENCODER_NAME, GRAD_ACCUM, EMA_DECAY, LABEL_SMOOTH,
+    ENCODER_FREEZE_EPOCHS, FOCAL_GAMMA,
+    USE_SWA, SWA_START_EPOCH, SWA_LR,
 )
 from utils.dataset import MARIDADataset
 import segmentation_models_pytorch as smp
 from semantic_segmentation.models.resnext_cbam_unet import HybridLoss
+from torch.optim.swa_utils import AveragedModel, SWALR
+
+
+# ── EMA (Exponential Moving Average) ─────────────────────────────────────────
+
+class ModelEMA:
+    """Maintains an exponential moving average of model parameters.
+    Smooths out training noise, typically improves generalisation by 1-3%."""
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
+            s_param.data.mul_(self.decay).add_(m_param.data, alpha=1.0 - self.decay)
+        for s_buf, m_buf in zip(self.shadow.buffers(), model.buffers()):
+            s_buf.data.copy_(m_buf.data)
+
+    def state_dict(self):
+        return self.shadow.state_dict()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -46,34 +74,37 @@ def compute_iou(pred, target, num_classes, ignore_index=-1):
 
 # ── Train / Val loops ─────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimizer, criterion, device, scaler):
+def train_epoch(model, loader, optimizer, criterion, device, scaler, grad_accum=1):
     model.train()
     total_loss = 0.0
     n_batches = 0
-    for batch in tqdm(loader, desc="[train]"):
+    optimizer.zero_grad()
+    for step, batch in enumerate(tqdm(loader, desc="[train]")):
         imgs   = batch["image"].to(device)
         masks  = batch["mask"].to(device)
         confs  = batch["conf"].to(device)
 
-        optimizer.zero_grad()
         try:
             autocast_ctx = torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda"))
         except Exception:
             autocast_ctx = torch.cuda.amp.autocast(enabled=(device.type == "cuda"))
         with autocast_ctx:
             logits = model(imgs)
-            loss   = criterion(logits, masks, confs)
+            loss   = criterion(logits, masks, confs) / grad_accum
 
         if torch.isnan(loss):
             continue
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * grad_accum
         n_batches += 1
     return total_loss / max(n_batches, 1)
 
@@ -130,6 +161,9 @@ def val_epoch(model, loader, criterion, device, num_classes):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
+        # Maximize CPU usage
+    import torch
+    torch.set_num_threads(8)
     # Logging
     import datetime
     log_dir = os.path.join(LOGS_DIR, "external_logs")
@@ -177,26 +211,68 @@ def main(args):
                           num_workers=args.workers, pin_memory=True)
 
     # Model: DeepLabV3+ with strong encoder for best debris detection
+    encoder = args.encoder if hasattr(args, 'encoder') and args.encoder else ENCODER_NAME
     model = smp.DeepLabV3Plus(
-        encoder_name="resnext50_32x4d",
+        encoder_name=encoder,
         encoder_weights="imagenet",
         in_channels=INPUT_BANDS,
         classes=NUM_CLASSES,
         activation=None,
     ).to(device)
+    log.info(f"Encoder: {encoder}")
     log.info(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Loss: moderate debris weighting + Dice (now nodata-safe)
+    # Freeze encoder for first N epochs so decoder learns debris patterns first
+    freeze_epochs = ENCODER_FREEZE_EPOCHS
+    def set_encoder_frozen(model, frozen):
+        for name, param in model.named_parameters():
+            if name.startswith("encoder."):
+                param.requires_grad = not frozen
+    set_encoder_frozen(model, True)
+    log.info(f"Encoder frozen for first {freeze_epochs} epochs")
+
+    # EMA model (smoothed weights for better generalisation)
+    ema = ModelEMA(model, decay=EMA_DECAY)
+    log.info(f"EMA enabled (decay={EMA_DECAY})")
+
+    # SWA model (Stochastic Weight Averaging for flatter minima)
+    swa_model = None
+    swa_scheduler = None
+    if USE_SWA:
+        swa_model = AveragedModel(model)
+        log.info(f"SWA enabled (start epoch={SWA_START_EPOCH}, lr={SWA_LR})")
+
+    # Loss: Focal CE + Dice + Lovász (nodata-safe, confidence-weighted)
     focal = True
-    focal_gamma = 2.0
+    focal_gamma = FOCAL_GAMMA
     class_weights = np.array(CLASS_WEIGHTS, dtype=np.float32)
-    criterion = HybridLoss(class_weights=class_weights, dice_weight=0.7, use_focal=focal, focal_gamma=focal_gamma)
+    criterion = HybridLoss(
+        class_weights=class_weights,
+        dice_weight=0.3,
+        lovasz_weight=0.4,
+        boundary_weight=0.1,
+        use_focal=focal,
+        focal_gamma=focal_gamma,
+        label_smoothing=LABEL_SMOOTH,
+    )
+    log.info(f"Loss: Focal-CE(γ={focal_gamma}) 0.2 + Dice 0.3 + Lovász 0.4 + Boundary 0.1 | label_smooth={LABEL_SMOOTH}")
+    log.info(f"Class weights: debris={CLASS_WEIGHTS[0]}, not-debris={CLASS_WEIGHTS[1]}")
+
+    # Gradient accumulation
+    grad_accum = args.grad_accum if hasattr(args, 'grad_accum') and args.grad_accum else GRAD_ACCUM
+    log.info(f"Gradient accumulation: {grad_accum} steps (effective batch = {args.batch * grad_accum})")
 
     # Optimiser with warmup + cosine annealing
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs - 5, 1), eta_min=1e-6)
-    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[5])
+    # Use separate param groups: higher LR for decoder, lower for encoder
+    encoder_params = [p for n, p in model.named_parameters() if n.startswith("encoder.")]
+    decoder_params = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
+    optimizer = optim.AdamW([
+        {"params": encoder_params, "lr": args.lr * 0.1},  # Encoder: 10x lower LR
+        {"params": decoder_params, "lr": args.lr},
+    ], weight_decay=args.weight_decay)
+    warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=8)
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs - 8, 1), eta_min=1e-7)
+    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[8])
     try:
         scaler = torch.amp.GradScaler(device if device.type == "cuda" else None, enabled=(device.type == "cuda"))
     except Exception:
@@ -223,8 +299,17 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        train_loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler)
-        val_loss, mean_iou, per_class_iou, debris_precision, debris_recall, debris_f1 = val_epoch(model, val_dl, criterion, device, NUM_CLASSES)
+        # Unfreeze encoder after freeze period
+        if epoch == freeze_epochs:
+            set_encoder_frozen(model, False)
+            log.info(f">>> Encoder unfrozen at epoch {epoch+1}")
+
+        train_loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler, grad_accum)
+        ema.update(model)  # Update EMA after each epoch
+
+        # Validate using EMA model (smoother, better generalisation)
+        ema_model = ema.shadow
+        val_loss, mean_iou, per_class_iou, debris_precision, debris_recall, debris_f1 = val_epoch(ema_model, val_dl, criterion, device, NUM_CLASSES)
 
         elapsed = time.time() - t0
         log.info(
@@ -244,6 +329,9 @@ def main(args):
         for i, (iou, cname) in enumerate(zip(per_class_iou, class_names)):
             log.info(f"Class {i}: {cname:15s} IoU={iou:.4f}")
         log.info(f"Debris precision: {debris_precision:.4f}  recall: {debris_recall:.4f}  F1: {debris_f1:.4f}")
+        # Warn if model is collapsing to majority class
+        if epoch > 5 and debris_recall < 0.01:
+            log.warning(f"⚠ DEBRIS RECALL = {debris_recall:.4f} — model may be collapsing to majority class!")
 
         # Save metrics to CSV
         metrics_writer.writerow([
@@ -257,22 +345,47 @@ def main(args):
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/val",   val_loss,   epoch)
         writer.add_scalar("mIoU/val",   mean_iou,   epoch)
+        writer.add_scalar("Debris/F1",        debris_f1,        epoch)
+        writer.add_scalar("Debris/Precision",  debris_precision, epoch)
+        writer.add_scalar("Debris/Recall",     debris_recall,    epoch)
+        writer.add_scalar("Debris/IoU",        per_class_iou[0] if len(per_class_iou) > 0 else 0.0, epoch)
+        writer.add_scalar("LR/decoder",  optimizer.param_groups[-1]['lr'], epoch)
 
-        scheduler.step()
+        # SWA: update averaged model after SWA_START_EPOCH
+        if USE_SWA and swa_model is not None and epoch >= SWA_START_EPOCH:
+            swa_model.update_parameters(model)
+            if swa_scheduler is None:
+                swa_scheduler = SWALR(optimizer, swa_lr=SWA_LR)
+                log.info(f">>> SWA started at epoch {epoch+1}, switching to SWA LR={SWA_LR}")
+            swa_scheduler.step()
+        else:
+            scheduler.step()
 
         # Checkpoint
         # Save last checkpoint (for resuming)
         ck = {
             "epoch": epoch, "model": model.state_dict(),
+            "ema_model": ema.state_dict(),
             "optimizer": optimizer.state_dict(), "best_iou": best_iou,
         }
         torch.save(ck, os.path.join(ckpt_dir, "last.pth"))
 
         # Track best checkpoint by debris F1 (our primary metric)
-        if debris_f1 > best_iou:            # variable still called best_iou for resume compat
+        # Use combined score: F1 must be nonzero AND recall must be meaningful
+        # This prevents "best" model from being one that ignores debris entirely
+        # Save EMA model as best (smoother generalisation)
+        current_score = debris_f1
+        # Require minimum recall of 5% to count as a valid model
+        if debris_recall < 0.05:
+            current_score = 0.0
+        if current_score > best_iou:            # variable still called best_iou for resume compat
             best_iou   = debris_f1
             no_improve = 0
-            torch.save(ck, ckpt_path)
+            best_ck = {
+                "epoch": epoch, "model": ema.state_dict(),
+                "optimizer": optimizer.state_dict(), "best_iou": best_iou,
+            }
+            torch.save(best_ck, ckpt_path)
             shared_best = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_best.pth")
             try:
                 import shutil
@@ -285,6 +398,14 @@ def main(args):
             if no_improve >= patience:
                 log.info(f"Early stopping after {patience} epochs without improvement.")
                 break
+
+    # SWA: update batch normalization stats and save SWA model
+    if USE_SWA and swa_model is not None and swa_scheduler is not None:
+        log.info("Updating SWA batch normalization statistics...")
+        torch.optim.swa_utils.update_bn(train_dl, swa_model, device=device)
+        swa_ckpt_path = os.path.join(ckpt_dir, "swa_model.pth")
+        torch.save({"model": swa_model.module.state_dict()}, swa_ckpt_path)
+        log.info(f"SWA model saved to {swa_ckpt_path}")
 
     log.info(f"Training complete. Best val mIoU: {best_iou:.4f}")
     metrics_csv_file.close()
@@ -325,5 +446,9 @@ if __name__ == "__main__":
     p.add_argument("--workers", type=int,   default=NUM_WORKERS)
     p.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
     p.add_argument("--patience", type=int, default=PATIENCE)
+    p.add_argument("--encoder", type=str, default=ENCODER_NAME,
+                   help="Encoder name (e.g. resnext50_32x4d, resnext101_32x8d)")
+    p.add_argument("--grad_accum", type=int, default=GRAD_ACCUM,
+                   help="Gradient accumulation steps")
     p.add_argument("--resume",  action="store_true")
     main(p.parse_args())

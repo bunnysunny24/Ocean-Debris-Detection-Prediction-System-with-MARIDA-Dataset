@@ -26,7 +26,8 @@ import matplotlib.colors as mcolors
 sys.path.insert(0, os.path.dirname(__file__))
 from configs.config import (
     INPUT_BANDS, NUM_CLASSES, CLASS_NAMES,
-    CHECKPOINTS_DIR, OUTPUTS_DIR, LOGS_DIR, PATCHES_DIR
+    CHECKPOINTS_DIR, OUTPUTS_DIR, LOGS_DIR, PATCHES_DIR,
+    ENCODER_NAME, MIN_DEBRIS_PIXELS
 )
 from utils.dataset import MARIDADataset, _find_tif
 from semantic_segmentation.models.resnext_cbam_unet import ResNeXtCBAMUNet
@@ -110,6 +111,101 @@ def _tta_predict(model, imgs, device):
     return accum / 8.0     # averaged probabilities
 
 
+def _multiscale_tta_predict(model, imgs, device, scales=(0.75, 1.0, 1.25)):
+    """
+    Multi-scale TTA: run geometric TTA at multiple scales and average.
+    Combines scale × 8 geometric = up to 24 variants for maximum performance.
+    """
+    B, C, H, W = imgs.shape
+    accum = torch.zeros(B, 2, H, W, device=device)
+    n = 0
+
+    for scale in scales:
+        if abs(scale - 1.0) < 1e-6:
+            scaled = imgs
+        else:
+            sH, sW = int(H * scale), int(W * scale)
+            scaled = torch.nn.functional.interpolate(
+                imgs, size=(sH, sW), mode='bilinear', align_corners=False
+            )
+
+        # 8x geometric TTA at this scale
+        geo_accum = torch.zeros(B, 2, scaled.shape[2], scaled.shape[3], device=device)
+        for k in range(4):
+            for hflip in (False, True):
+                x = scaled.clone()
+                if hflip:
+                    x = x.flip(-1)
+                if k > 0:
+                    x = x.rot90(k, [-2, -1])
+
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1)
+
+                if k > 0:
+                    probs = probs.rot90(-k, [-2, -1])
+                if hflip:
+                    probs = probs.flip(-1)
+
+                geo_accum += probs
+
+        geo_accum /= 8.0
+
+        # Resize back to original size if needed
+        if abs(scale - 1.0) > 1e-6:
+            geo_accum = torch.nn.functional.interpolate(
+                geo_accum, size=(H, W), mode='bilinear', align_corners=False
+            )
+
+        accum += geo_accum
+        n += 1
+
+    return accum / n
+
+
+def _load_model(ckpt_path, device, log):
+    """Load a single model from checkpoint. Returns (model, success)."""
+    try:
+        try:
+            ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        except TypeError:
+            ck = torch.load(ckpt_path, map_location=device)
+    except Exception as e:
+        log.warning(f"Could not load {ckpt_path}: {e}")
+        return None, False
+
+    state_keys = list(ck.get("model", {}).keys()) if isinstance(ck, dict) else []
+    use_smp = any(k.startswith("encoder.") or k.startswith("decoder.") or k.startswith("segmentation_head.") for k in state_keys)
+
+    if use_smp and smp is not None:
+        loaded = False
+        model = None
+        for enc_name in [ENCODER_NAME, "resnext50_32x4d", "resnet50"]:
+            try:
+                model = smp.DeepLabV3Plus(
+                    encoder_name=enc_name, encoder_weights=None,
+                    in_channels=INPUT_BANDS, classes=NUM_CLASSES, activation=None,
+                ).to(device)
+                model.load_state_dict(ck["model"])
+                loaded = True
+                break
+            except Exception:
+                continue
+        if not loaded:
+            log.warning(f"Could not load smp model from {ckpt_path}")
+            return None, False
+    else:
+        model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES,
+                                pretrained=False).to(device)
+        try:
+            model.load_state_dict(ck["model"])
+        except RuntimeError:
+            model.load_state_dict(ck["model"], strict=False)
+
+    model.eval()
+    return model, True
+
+
 @torch.no_grad()
 def evaluate(args):
     logging.basicConfig(
@@ -124,51 +220,29 @@ def evaluate(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Model selection based on checkpoint keys ──
-    # Load checkpoint first, then instantiate matching architecture
-    try:
-        ck = torch.load(args.ckpt, map_location=device, weights_only=False)
-    except TypeError:
-        ck = torch.load(args.ckpt, map_location=device)
+    # ── Load models (single or ensemble) ──
+    models = []
+    ckpt_paths = [args.ckpt]
 
-    state_keys = list(ck.get("model", {}).keys()) if isinstance(ck, dict) else []
-    use_smp = any(k.startswith("encoder.") or k.startswith("decoder.") or k.startswith("segmentation_head.") for k in state_keys)
+    if args.ensemble:
+        # Auto-discover SWA and last checkpoints from same run directory
+        ckpt_dir = os.path.dirname(os.path.abspath(args.ckpt))
+        for extra in ["swa_model.pth", "last.pth"]:
+            extra_path = os.path.join(ckpt_dir, extra)
+            if os.path.exists(extra_path) and extra_path not in ckpt_paths:
+                ckpt_paths.append(extra_path)
+        log.info(f"Ensemble mode: loading {len(ckpt_paths)} checkpoints")
 
-    if use_smp and smp is not None:
-        log.info("Checkpoint looks like an smp model. Instantiating DeepLabV3Plus to match checkpoint.")
-        # Try resnext50_32x4d first (new training), fall back to resnet50 (old ckpts)
-        try:
-            model = smp.DeepLabV3Plus(
-                encoder_name="resnext50_32x4d",
-                encoder_weights=None,
-                in_channels=INPUT_BANDS,
-                classes=NUM_CLASSES,
-                activation=None,
-            ).to(device)
-            model.load_state_dict(ck["model"])
-        except Exception:
-            model = smp.DeepLabV3Plus(
-                encoder_name="resnet50",
-                encoder_weights=None,
-                in_channels=INPUT_BANDS,
-                classes=NUM_CLASSES,
-                activation=None,
-            ).to(device)
-            model.load_state_dict(ck["model"], strict=False)
-    else:
-        model = ResNeXtCBAMUNet(in_channels=INPUT_BANDS, num_classes=NUM_CLASSES,
-                                pretrained=False).to(device)
+    for cp in ckpt_paths:
+        m, ok = _load_model(cp, device, log)
+        if ok:
+            models.append(m)
+            log.info(f"Loaded checkpoint: {cp}")
 
-    # Try strict load first, fall back to non-strict with a warning
-    if not use_smp or smp is None:
-        # Only load for custom model; smp model already loaded above
-        try:
-            model.load_state_dict(ck["model"])
-        except RuntimeError as e:
-            log.warning(f"Strict state_dict load failed: {e}. Trying non-strict load.")
-            model.load_state_dict(ck["model"], strict=False)
-    model.eval()
-    log.info(f"Loaded checkpoint: {args.ckpt}")
+    if not models:
+        raise RuntimeError("No valid checkpoints loaded")
+
+    model = models[0]  # primary model (used for non-ensemble path too)
 
     # ── Data ──
     ds = MARIDADataset(args.split, augment_data=False, use_conf_weights=False)
@@ -192,7 +266,21 @@ def evaluate(args):
         except Exception:
             autocast_ctx = torch.cuda.amp.autocast(enabled=(device.type == "cuda"))
         with autocast_ctx:
-            if args.tta:
+            if args.ensemble and len(models) > 1:
+                # Ensemble: average softmax probabilities across all models
+                accum = torch.zeros(imgs.shape[0], NUM_CLASSES, imgs.shape[2], imgs.shape[3], device=device)
+                for m in models:
+                    if args.ms_tta:
+                        accum += _multiscale_tta_predict(m, imgs, device)
+                    elif args.tta:
+                        accum += _tta_predict(m, imgs, device)
+                    else:
+                        accum += torch.softmax(m(imgs), dim=1)
+                probs = (accum / len(models)).cpu().numpy()
+            elif args.ms_tta:
+                probs_t = _multiscale_tta_predict(model, imgs, device)
+                probs = probs_t.cpu().numpy()
+            elif args.tta:
                 probs_t = _tta_predict(model, imgs, device)   # (B,2,H,W)
                 probs = probs_t.cpu().numpy()
             else:
@@ -312,4 +400,8 @@ if __name__ == "__main__":
     p.add_argument("--no_postprocessing", action="store_true", default=False)
     p.add_argument("--tta",             action="store_true", default=False,
                    help="Enable 8× test-time augmentation (flip+rot90)")
+    p.add_argument("--ms_tta",          action="store_true", default=False,
+                   help="Enable multi-scale TTA (3 scales × 8 geometric = 24 variants)")
+    p.add_argument("--ensemble",        action="store_true", default=False,
+                   help="Ensemble: average best + SWA + last checkpoints from same run directory")
     evaluate(p.parse_args())

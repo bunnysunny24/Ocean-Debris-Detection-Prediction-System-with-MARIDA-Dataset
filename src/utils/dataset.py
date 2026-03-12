@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from configs.config import (
     PATCHES_DIR, SPLITS_DIR, INPUT_BANDS, PATCH_SIZE,
     AUG_PROB, ELASTIC_ALPHA, ELASTIC_SIGMA,
+    COPY_PASTE_PROB, OVERSAMPLE_HEAVY, OVERSAMPLE_LIGHT,
+    RAW_BANDS, USE_SPECTRAL_INDICES,
 )
 
 
@@ -68,10 +70,29 @@ def _find_conf_tif(patch_id: str):
 
 
 # ── Spectral normalisation stats (computed from training data; update if needed) ──
-# shape: (INPUT_BANDS,)  –– percentile-based per-band clipping + scaling
-BAND_P2  = np.array([0.]*INPUT_BANDS)   # will be filled lazily
-BAND_P98 = np.array([1.]*INPUT_BANDS)
+# shape: (RAW_BANDS,)  –– percentile-based per-band clipping + scaling
+BAND_P2  = np.array([0.]*RAW_BANDS)   # will be filled lazily
+BAND_P98 = np.array([1.]*RAW_BANDS)
 _STATS_COMPUTED = False
+
+
+def _compute_spectral_indices(arr: np.ndarray) -> np.ndarray:
+    """Compute 5 spectral indices from raw Sentinel-2 bands.
+    arr: (11, H, W) band order: B1,B2,B3,B4,B5,B6,B7,B8,B8A,B11,B12
+    Returns: (5, H, W) -> NDVI, NDWI, FDI, PI, RNDVI"""
+    eps = 1e-8
+    B3  = arr[2].astype(np.float32)   # Green
+    B4  = arr[3].astype(np.float32)   # Red
+    B8  = arr[7].astype(np.float32)   # NIR
+    B12 = arr[10].astype(np.float32)  # SWIR2
+
+    NDVI  = (B8 - B4) / (B8 + B4 + eps)
+    NDWI  = (B3 - B8) / (B3 + B8 + eps)
+    FDI   = B8 - (B4 + (B12 - B4) * (832.8 - 664.6) / (2201.5 - 664.6))
+    PI    = B4 / (B3 + B4 + B8 + eps)
+    RNDVI = (B4 - B3) / (B4 + B3 + eps)
+
+    return np.stack([NDVI, NDWI, FDI, PI, RNDVI], axis=0).astype(np.float32)
 
 
 def _compute_norm_stats(split_file: str, n_samples: int = 0):
@@ -86,18 +107,18 @@ def _compute_norm_stats(split_file: str, n_samples: int = 0):
         patch_ids = patch_ids[:n_samples]
         random.seed()                         # re-seed
 
-    all_vals = [[] for _ in range(INPUT_BANDS)]
+    all_vals = [[] for _ in range(RAW_BANDS)]
     for pid in patch_ids:
         tif = _find_tif(pid)
         if tif is None:
             continue
         with rasterio.open(tif) as src:
             arr = src.read().astype(np.float32)   # (B, H, W)
-        arr = arr[:INPUT_BANDS]
-        for b in range(min(INPUT_BANDS, arr.shape[0])):
+        arr = arr[:RAW_BANDS]
+        for b in range(min(RAW_BANDS, arr.shape[0])):
             all_vals[b].append(arr[b].ravel())
 
-    for b in range(INPUT_BANDS):
+    for b in range(RAW_BANDS):
         if all_vals[b]:
             cat = np.concatenate(all_vals[b])
             BAND_P2[b]  = np.nanpercentile(cat, 2)
@@ -129,9 +150,12 @@ def get_advanced_augment():
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
+        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-15, 15),
+                 mode=0, p=0.3),
         A.GaussNoise(std_range=(0.01, 0.03), p=0.2),
         A.ElasticTransform(alpha=ELASTIC_ALPHA, sigma=ELASTIC_SIGMA, p=0.15),
         A.GridDistortion(p=0.1),
+        A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.2),
     ], additional_targets={'conf_raw': 'mask'})
 
 
@@ -185,6 +209,7 @@ class MARIDADataset(Dataset):
         if split == "train":
             debris_patches = []
             normal_patches = []
+            self._debris_pool = []  # IDs of patches with debris (for copy-paste aug)
             for pid in patch_ids:
                 mask_tif = _find_mask_tif(pid)
                 if mask_tif:
@@ -192,16 +217,20 @@ class MARIDADataset(Dataset):
                         mask = src.read(1).astype(np.int64) - 1
                     n_debris = (mask == 0).sum()
                     if n_debris >= 20:
-                        debris_patches.extend([pid] * 8)   # heavy debris: 8×
+                        debris_patches.extend([pid] * OVERSAMPLE_HEAVY)
+                        self._debris_pool.append(pid)
                     elif n_debris >= 1:
-                        debris_patches.extend([pid] * 5)   # light debris: 5×
+                        debris_patches.extend([pid] * OVERSAMPLE_LIGHT)
+                        self._debris_pool.append(pid)
                     else:
                         normal_patches.append(pid)
                 else:
                     normal_patches.append(pid)
             self.patch_ids = debris_patches + normal_patches
+            print(f"[Dataset] Copy-paste pool: {len(self._debris_pool)} debris patches")
         else:
             self.patch_ids = patch_ids
+            self._debris_pool = []
 
         # Compute normalisation stats from training split on first call
         global _STATS_COMPUTED
@@ -214,6 +243,75 @@ class MARIDADataset(Dataset):
     def __len__(self):
         return len(self.patch_ids)
 
+    def _copy_paste_debris(self, img, mask, conf_raw):
+        """Copy-paste augmentation: paste debris pixels from a random donor patch.
+        This dramatically increases effective debris pixel count per sample.
+        img: (B,H,W) normalised float32, mask: (H,W) int64, conf_raw: (H,W) int64."""
+        if not self._debris_pool or random.random() > COPY_PASTE_PROB:
+            return img, mask, conf_raw
+
+        # Paste from 1 to 3 donors for more debris diversity
+        n_donors = random.randint(1, 3)
+        for _ in range(n_donors):
+            donor_pid = random.choice(self._debris_pool)
+            donor_tif = _find_tif(donor_pid)
+            donor_mask_tif = _find_mask_tif(donor_pid)
+            if not donor_tif or not donor_mask_tif:
+                continue
+
+            # Load donor image + mask
+            with rasterio.open(donor_tif) as src:
+                donor_img = src.read(list(range(1, RAW_BANDS + 1))).astype(np.float32)
+            np.nan_to_num(donor_img, copy=False)
+            # Compute donor spectral indices before normalisation
+            if USE_SPECTRAL_INDICES:
+                donor_si = _compute_spectral_indices(donor_img)
+            donor_img = normalise(donor_img)
+            if USE_SPECTRAL_INDICES:
+                donor_si = np.clip(donor_si, -3.0, 3.0)
+                donor_si = (donor_si + 3.0) / 6.0
+                donor_img = np.concatenate([donor_img, donor_si], axis=0)
+
+            with rasterio.open(donor_mask_tif) as src:
+                donor_mask_raw = src.read(1).astype(np.int64) - 1
+            donor_bin = np.full_like(donor_mask_raw, fill_value=1, dtype=np.int64)
+            donor_bin[donor_mask_raw == 0] = 0   # debris
+            donor_bin[donor_mask_raw == -1] = -1  # nodata
+
+            # Find debris pixel coordinates in donor
+            debris_ys, debris_xs = np.where(donor_bin == 0)
+            if len(debris_ys) == 0:
+                continue
+
+            # Random spatial offset for pasting (shift debris cluster)
+            dy = random.randint(-128, 128)
+            dx = random.randint(-128, 128)
+
+            # Random geometric transform: flip/rotate
+            do_hflip = random.random() > 0.5
+            do_vflip = random.random() > 0.5
+            k_rot = random.randint(0, 3)  # 0, 90, 180, 270 degrees
+
+            H, W = mask.shape
+            for y, x in zip(debris_ys, debris_xs):
+                # Apply flip
+                sy, sx = y, x
+                if do_hflip:
+                    sx = W - 1 - sx
+                if do_vflip:
+                    sy = H - 1 - sy
+                # Apply rotation (90-degree increments)
+                for _ in range(k_rot):
+                    sy, sx = sx, H - 1 - sy
+
+                ny, nx = sy + dy, sx + dx
+                if 0 <= ny < H and 0 <= nx < W:
+                    img[:, ny, nx] = donor_img[:, y, x]
+                    mask[ny, nx] = 0        # debris
+                    conf_raw[ny, nx] = 2    # high confidence
+
+        return img, mask, conf_raw
+
     def __getitem__(self, idx):
         pid  = self.patch_ids[idx]
 
@@ -222,8 +320,12 @@ class MARIDADataset(Dataset):
         if tif is None:
             raise FileNotFoundError(f"Patch tif not found for id: {pid}")
         with rasterio.open(tif) as src:
-            img = src.read(list(range(1, INPUT_BANDS + 1))).astype(np.float32)   # (B,H,W)
+            img = src.read(list(range(1, RAW_BANDS + 1))).astype(np.float32)   # (11,H,W)
         np.nan_to_num(img, copy=False)  # replace NaN with 0 (some patches have NaN in bands 9-10)
+
+        # ── Compute spectral indices before normalisation (need raw reflectance) ──
+        if USE_SPECTRAL_INDICES:
+            si = _compute_spectral_indices(img)  # (5, H, W)
 
         # ── Load mask ──
         mask_tif = _find_mask_tif(pid)
@@ -248,8 +350,18 @@ class MARIDADataset(Dataset):
                 with rasterio.open(conf_tif) as src:
                     conf_raw = src.read(1).astype(np.int64)  # 0, 1, 2
 
-        # ── Normalise ──
+        # ── Normalise raw bands ──
         img = normalise(img)
+
+        # ── Append spectral indices (already in meaningful range, clip to [-1,1] then shift to [0,1]) ──
+        if USE_SPECTRAL_INDICES:
+            si = np.clip(si, -3.0, 3.0)  # clip extreme values
+            si = (si + 3.0) / 6.0        # map to [0, 1]
+            img = np.concatenate([img, si], axis=0)  # (16, H, W)
+
+        # ── Copy-paste debris augmentation (before spatial aug, after normalisation) ──
+        if self.augment_data:
+            img, mask, conf_raw = self._copy_paste_debris(img, mask, conf_raw)
 
         # ── Albumentations expects (H,W,C) for images, (H,W) for mask ──
         img = np.transpose(img, (1, 2, 0))  # (H,W,B)
