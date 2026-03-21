@@ -77,10 +77,21 @@ def main(args):
         ]
         if args.resume:
             train_cmd.append("--resume")
+        if hasattr(args, 'grad_accum'):
+            train_cmd += ["--grad_accum", str(args.grad_accum)]
         run(train_cmd)
 
-    # ── Step 2: Evaluate ──
-    run([sys.executable, "evaluate.py", "--split", "test", "--save_masks"])
+    # ── Step 2: Evaluate — use EMA checkpoint + TTA for best research results ──
+    import glob
+    # Find the most recent run's EMA checkpoint; fall back to shared best
+    ema_shared = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_ema_best.pth")
+    best_shared = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_best.pth")
+    ckpt_to_use = ema_shared if os.path.exists(ema_shared) else best_shared
+    run([sys.executable, "evaluate.py",
+         "--split", "test",
+         "--save_masks",
+         "--tta",
+         "--ckpt", ckpt_to_use])
 
     # ── Step 3: Post-process ──
     from configs.config import OUTPUTS_DIR as _OUT

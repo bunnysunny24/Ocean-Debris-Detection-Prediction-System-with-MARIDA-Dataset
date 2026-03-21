@@ -1,8 +1,15 @@
 """
 semantic_segmentation/models/resnext_cbam_unet.py
 -------------------------------------------------
-ResNeXt-50 encoder + CBAM attention + U-Net decoder
-for 11-band → 15-class semantic segmentation.
+ResNeXt encoder (50 or 101) + CBAM attention + U-Net decoder
+for binary marine debris segmentation (debris vs not-debris).
+
+Architecture:
+  - Dynamic backbone: resnext50_32x4d or resnext101_32x8d
+  - Dropout2d(0.1) in every decoder block  → reduces overfitting
+  - Deep supervision auxiliary head at dec3 → stronger mid-level gradient signal
+  - HybridLoss: Focal-CE + Tversky (α=0.3, β=0.7) → recall-first rare-class learning
+  - Log-Tversky for numerical stability
 
 Requires: torch, torchvision
 """
@@ -10,10 +17,13 @@ Requires: torch, torchvision
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnext50_32x4d
+from torchvision.models import (
+    ResNeXt50_32X4D_Weights, resnext50_32x4d,
+    ResNeXt101_32X8D_Weights, resnext101_32x8d,
+)
 
 
-# ── CBAM ─────────────────────────────────────────────────────────────────────
+# ── CBAM ──────────────────────────────────────────────────────────────────────
 
 class ChannelAttention(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
@@ -60,13 +70,16 @@ class CBAM(nn.Module):
 # ── Decoder block ─────────────────────────────────────────────────────────────
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    """U-Net decoder block with CBAM + Dropout2d for regularisation."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, dropout: float = 0.1):
         super().__init__()
         self.up   = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
         self.conv = nn.Sequential(
             nn.Conv2d(out_ch + skip_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=dropout),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
@@ -75,7 +88,6 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        # handle odd spatial sizes
         if x.shape != skip.shape:
             x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
         x = torch.cat([x, skip], dim=1)
@@ -85,62 +97,100 @@ class DecoderBlock(nn.Module):
 
 # ── Main Model ────────────────────────────────────────────────────────────────
 
+# Backbone encoder channel sizes are identical for resnext50 and resnext101:
+#   enc0: 64 ch, enc1: 256 ch, enc2: 512 ch, enc3: 1024 ch, enc4: 2048 ch
+# So the decoder is compatible with both — only the backbone loading differs.
+
+SUPPORTED_BACKBONES = {
+    "resnext50_32x4d":  (resnext50_32x4d,  ResNeXt50_32X4D_Weights.IMAGENET1K_V1),
+    "resnext101_32x8d": (resnext101_32x8d, ResNeXt101_32X8D_Weights.IMAGENET1K_V1),
+}
+
+
 class ResNeXtCBAMUNet(nn.Module):
     """
+    ResNeXt + CBAM U-Net with deep supervision.
+
     Parameters
     ----------
     in_channels : int
-        Number of input spectral bands (default 11 for MARIDA).
+        Number of input spectral channels (16 for MARIDA with spectral indices).
     num_classes : int
-        Number of output classes (default 15).
+        Number of output classes (2 for binary debris/not-debris).
     pretrained : bool
-        Load ImageNet weights for ResNeXt-50 (first conv adapted to in_channels).
+        Load ImageNet weights (first conv averaged across input channels).
+    dropout : float
+        Dropout2d probability in decoder blocks.
+    deep_supervision : bool
+        Return auxiliary logits from dec3 during training.
+    backbone : str
+        'resnext50_32x4d' (default, ~41M params, works well on CPU/GPU)
+        'resnext101_32x8d' (recommended for GPU with ≥8GB VRAM, ~88M params)
     """
 
-    def __init__(self, in_channels: int = 11, num_classes: int = 15, pretrained: bool = True):
+    def __init__(self, in_channels: int = 16, num_classes: int = 2,
+                 pretrained: bool = True, dropout: float = 0.1,
+                 deep_supervision: bool = True,
+                 backbone: str = "resnext50_32x4d"):
         super().__init__()
+        self.deep_supervision = deep_supervision
 
-        backbone = resnext50_32x4d(pretrained=pretrained)
+        if backbone not in SUPPORTED_BACKBONES:
+            raise ValueError(f"backbone must be one of {list(SUPPORTED_BACKBONES.keys())}, got '{backbone}'")
+
+        build_fn, weights_enum = SUPPORTED_BACKBONES[backbone]
+        weights = weights_enum if pretrained else None
+        bb = build_fn(weights=weights)
 
         # ── Adapt first conv to arbitrary input channels ──
-        orig_conv = backbone.conv1
+        orig_conv = bb.conv1
         self.enc0 = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            backbone.bn1,
-            backbone.relu,
+            bb.bn1,
+            bb.relu,
         )
         if pretrained and in_channels != 3:
-            # Average the pretrained RGB weights across channel dim, then tile
             with torch.no_grad():
-                mean_w = orig_conv.weight.mean(dim=1, keepdim=True)   # (64,1,7,7)
+                mean_w = orig_conv.weight.mean(dim=1, keepdim=True)  # (64,1,7,7)
                 new_w  = mean_w.repeat(1, in_channels, 1, 1)
                 self.enc0[0].weight.copy_(new_w)
 
-        self.pool    = backbone.maxpool   # stride-2
-
-        self.enc1    = backbone.layer1    # 256 ch,  stride 1
-        self.enc2    = backbone.layer2    # 512 ch,  stride 2
-        self.enc3    = backbone.layer3    # 1024 ch, stride 2
-        self.enc4    = backbone.layer4    # 2048 ch, stride 2
+        self.pool = bb.maxpool   # stride-2
+        self.enc1 = bb.layer1   # 256 ch
+        self.enc2 = bb.layer2   # 512 ch
+        self.enc3 = bb.layer3   # 1024 ch
+        self.enc4 = bb.layer4   # 2048 ch
 
         # CBAM on deepest encoder feature
         self.bottleneck_cbam = CBAM(2048)
 
-        # ── Decoder ──
-        self.dec4 = DecoderBlock(2048, 1024, 512)
-        self.dec3 = DecoderBlock(512,   512,  256)
-        self.dec2 = DecoderBlock(256,   256,  128)
-        self.dec1 = DecoderBlock(128,    64,   64)
+        # Decoder — same widths work for both resnext50 and resnext101
+        self.dec4 = DecoderBlock(2048, 1024, 256, dropout=dropout)
+        self.dec3 = DecoderBlock(256,   512, 128, dropout=dropout)
+        self.dec2 = DecoderBlock(128,   256,  64, dropout=dropout)
+        self.dec1 = DecoderBlock(64,     64,  64, dropout=dropout)
 
-        # Final upsampling to input resolution
         self.final_up   = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
         self.final_conv = nn.Conv2d(64, num_classes, kernel_size=1)
+
+        # Deep supervision auxiliary head (dec3 output, 1/8 resolution)
+        if deep_supervision:
+            self.aux_conv = nn.Sequential(
+                nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(p=dropout),
+                nn.Conv2d(64, num_classes, kernel_size=1),
+            )
 
         self._init_decoder()
 
     def _init_decoder(self):
-        for m in [self.dec4, self.dec3, self.dec2, self.dec1,
-                  self.final_up, self.final_conv]:
+        modules = [self.dec4, self.dec3, self.dec2, self.dec1,
+                   self.final_up, self.final_conv]
+        if self.deep_supervision:
+            modules.append(self.aux_conv)
+        for m in modules:
             for p in m.modules():
                 if isinstance(p, nn.Conv2d):
                     nn.init.kaiming_normal_(p.weight, mode="fan_out", nonlinearity="relu")
@@ -149,199 +199,104 @@ class ResNeXtCBAMUNet(nn.Module):
                     nn.init.constant_(p.bias, 0)
 
     def forward(self, x):
-        # ── Encoder ──
-        e0 = self.enc0(x)           # /2
-        p  = self.pool(e0)          # /4
-        e1 = self.enc1(p)           # /4   256ch
-        e2 = self.enc2(e1)          # /8   512ch
-        e3 = self.enc3(e2)          # /16  1024ch
-        e4 = self.enc4(e3)          # /32  2048ch
+        e0 = self.enc0(x)
+        p  = self.pool(e0)
+        e1 = self.enc1(p)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
 
         b  = self.bottleneck_cbam(e4)
 
-        # ── Decoder ──
-        d4 = self.dec4(b,  e3)      # /16  512ch
-        d3 = self.dec3(d4, e2)      # /8   256ch
-        d2 = self.dec2(d3, e1)      # /4   128ch
-        d1 = self.dec1(d2, e0)      # /2   64ch
+        d4 = self.dec4(b,  e3)
+        d3 = self.dec3(d4, e2)
+        d2 = self.dec2(d3, e1)
+        d1 = self.dec1(d2, e0)
 
-        out = self.final_up(d1)     # /1
+        out = self.final_up(d1)
         out = F.interpolate(out, size=x.shape[2:], mode="bilinear", align_corners=False)
-        return self.final_conv(out)  # (B, num_classes, H, W)
+        main_logits = self.final_conv(out)
+
+        if self.deep_supervision and self.training:
+            aux_logits = self.aux_conv(d3)
+            aux_logits = F.interpolate(aux_logits, size=x.shape[2:], mode="bilinear", align_corners=False)
+            return main_logits, aux_logits
+
+        return main_logits
 
 
-# ── Loss ─────────────────────────────────────────────────────────────────────
-
-# ── Lovász-Softmax (better IoU surrogate than Dice) ─────────────────────────
-
-def _lovasz_grad(gt_sorted):
-    """Compute gradient of the Lovász extension w.r.t sorted errors.
-    Ref: Berman et al., "The Lovász-Softmax loss" (CVPR 2018)."""
-    p = len(gt_sorted)
-    gts = gt_sorted.sum()
-    intersection = gts - gt_sorted.float().cumsum(0)
-    union = gts + (1 - gt_sorted).float().cumsum(0)
-    jaccard = 1.0 - intersection / union
-    if p > 1:
-        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
-    return jaccard
-
-
-def _lovasz_softmax_flat(probas, labels, classes='present'):
-    """Multi-class Lovász-Softmax loss on flattened tensors.
-    probas: [P, C] softmax probabilities, labels: [P] ground truth."""
-    if probas.numel() == 0:
-        return probas * 0.0
-    C = probas.size(1)
-    losses = []
-    class_to_sum = list(range(C)) if classes in ('all', 'present') else classes
-    for c in class_to_sum:
-        fg = (labels == c).float()
-        if classes == 'present' and fg.sum() == 0:
-            continue
-        fg_class = probas[:, c]
-        errors = (fg - fg_class).abs()
-        errors_sorted, perm = torch.sort(errors, 0, descending=True)
-        fg_sorted = fg[perm.data]
-        losses.append(torch.dot(errors_sorted, _lovasz_grad(fg_sorted)))
-    if losses:
-        return torch.stack(losses).mean()
-    return torch.tensor(0.0, device=probas.device, requires_grad=True)
-
-
-def lovasz_softmax(probas, labels, classes='present', ignore_index=-1):
-    """Multi-class Lovász-Softmax loss for 4D tensors (B,C,H,W)."""
-    B, C, H, W = probas.shape
-    probas = probas.permute(0, 2, 3, 1).contiguous().view(-1, C)
-    labels = labels.view(-1)
-    if ignore_index is not None:
-        valid = labels != ignore_index
-        probas = probas[valid]
-        labels = labels[valid]
-    return _lovasz_softmax_flat(probas, labels, classes=classes)
-
+# ── Loss ──────────────────────────────────────────────────────────────────────
 
 class HybridLoss(nn.Module):
     """
-    Weighted Focal-CE + Lovász-Softmax + Dice loss + Boundary-aware auxiliary.
-    Supports per-pixel confidence weights and ignores index -1 (nodata).
-    Lovász directly optimises IoU; Dice provides overlap gradient; Focal-CE handles hard examples.
-    Boundary term sharpens edges of small debris patches.
+    Focal-CE + Tversky Loss for rare-class debris detection.
+
+    Tversky with β > α penalises missed debris (FN) more than false alarms (FP).
+    Default: α=0.3, β=0.7  →  FN penalised 2.3× more than FP.
+    Log-Tversky ensures gradient stability at extreme class imbalance.
+
+    Also handles deep supervision: accepts (main_logits, aux_logits) tuple.
+    Nodata-safe: ignores index -1 everywhere.
     """
 
-    def __init__(self, class_weights=None, dice_weight: float = 0.3,
-                 lovasz_weight: float = 0.4, boundary_weight: float = 0.1,
-                 ignore_index: int = -1, use_focal: bool = True,
-                 focal_gamma: float = 2.0, label_smoothing: float = 0.0):
+    def __init__(self, class_weights=None, tversky_weight=0.7,
+                 ignore_index=-1, use_focal=True,
+                 focal_gamma=2.0, label_smoothing=0.0,
+                 tversky_alpha=0.3, tversky_beta=0.7,
+                 aux_weight=0.4):
         super().__init__()
         self.class_weights = torch.tensor(class_weights, dtype=torch.float32) if class_weights is not None else None
-        self.dice_w       = dice_weight
-        self.lovasz_w     = lovasz_weight
-        self.boundary_w   = boundary_weight
-        self.ce_w         = 1.0 - dice_weight - lovasz_weight - boundary_weight
-        self.ignore_idx   = ignore_index
-        self.use_focal    = use_focal
-        self.focal_gamma  = focal_gamma
+        self.tversky_w  = tversky_weight
+        self.ce_w       = 1.0 - tversky_weight
+        self.ignore_idx = ignore_index
+        self.use_focal  = use_focal
+        self.focal_gamma = focal_gamma
         self.label_smooth = label_smoothing
+        self.alpha      = tversky_alpha
+        self.beta       = tversky_beta
+        self.aux_weight = aux_weight
 
-    @staticmethod
-    def _extract_boundary(mask, ignore_idx=-1):
-        """Extract boundary pixels via morphological dilation - erosion on the debris mask.
-        Returns a float tensor of same shape with 1.0 at boundary pixels."""
-        debris = (mask == 0).float()  # debris class = 0
-        valid = (mask != ignore_idx).float()
-        debris = debris * valid
-        # Use max-pool as dilation and -max_pool(-x) as erosion (3x3 kernel)
-        debris_4d = debris.unsqueeze(1)  # (B,1,H,W)
-        dilated = torch.nn.functional.max_pool2d(debris_4d, kernel_size=3, stride=1, padding=1)
-        eroded  = -torch.nn.functional.max_pool2d(-debris_4d, kernel_size=3, stride=1, padding=1)
-        boundary = ((dilated - eroded) > 0).float().squeeze(1)  # (B,H,W)
-        return boundary * valid
-
-    def _boundary_loss(self, logits, target):
-        """BCE loss on debris probability at boundary pixels."""
-        boundary = self._extract_boundary(target, self.ignore_idx)
-        n_boundary = boundary.sum()
-        if n_boundary < 1:
-            return torch.tensor(0.0, device=logits.device)
-        pred_debris_prob = torch.softmax(logits, dim=1)[:, 0]  # P(debris)
-        gt_debris = ((target == 0) & (target != self.ignore_idx)).float()
-        bce = torch.nn.functional.binary_cross_entropy(
-            pred_debris_prob.clamp(1e-6, 1 - 1e-6), gt_debris, reduction='none'
-        )
-        return (bce * boundary).sum() / (n_boundary + 1e-8)
-
-    def _dice(self, pred_soft, target, num_classes):
-        """Debris-weighted Dice loss. Debris class gets 2x weight in Dice."""
-        eps   = 1e-6
+    def _tversky(self, pred_soft, target, num_classes):
+        eps  = 1e-6
         valid = (target != self.ignore_idx)
-        dice_per_class = []
+        losses = []
         for c in range(num_classes):
-            t = ((target == c) & valid).float()
-            p = pred_soft[:, c] * valid.float()
-            dice_score = (2 * (p * t).sum() + eps) / (p.sum() + t.sum() + eps)
-            dice_per_class.append(dice_score)
-        # Weight debris class (c=0) more heavily in dice
-        if num_classes >= 2:
-            weighted_dice = 0.7 * dice_per_class[0] + 0.3 * dice_per_class[1]
-        else:
-            weighted_dice = sum(dice_per_class) / num_classes
-        return 1.0 - weighted_dice
+            t   = ((target == c) & valid).float()
+            p   = pred_soft[:, c] * valid.float()
+            tp  = (p * t).sum()
+            fp  = (p * (1 - t)).sum()
+            fn  = ((1 - p) * t).sum()
+            tversky_score = (tp + eps) / (tp + self.alpha * fp + self.beta * fn + eps)
+            losses.append(-torch.log(tversky_score + eps))
+        return sum(losses) / num_classes
 
-    def forward(self, logits, target, conf_weights=None):
-        """
-        logits       : (B, C, H, W)
-        target       : (B, H, W)  long, -1 = nodata
-        conf_weights : (B, H, W)  float in [0,1] or None
-        """
-        device = logits.device
-        if self.class_weights is not None:
-            weights = self.class_weights.to(device)
-        else:
-            weights = None
+    def _single_loss(self, logits, target, conf_weights=None):
+        device  = logits.device
+        weights = self.class_weights.to(device) if self.class_weights is not None else None
 
-        # ── Valid-pixel mask (nodata = -1 must not contribute to loss) ──
-        valid_mask = (target != self.ignore_idx).float()
+        valid_mask  = (target != self.ignore_idx).float()
         safe_target = target.clone()
         safe_target[target == self.ignore_idx] = 0
 
-        # ── Focal Cross-Entropy ──
-        ce_fn  = torch.nn.CrossEntropyLoss(
-            weight=weights, reduction="none",
-            label_smoothing=self.label_smooth,
-        )
+        ce_fn  = nn.CrossEntropyLoss(weight=weights, reduction="none",
+                                     label_smoothing=self.label_smooth)
         ce_map = ce_fn(logits, safe_target)
-
         if self.use_focal:
-            pt = torch.exp(-ce_map)
+            pt     = torch.exp(-ce_map)
             ce_map = ((1 - pt) ** self.focal_gamma) * ce_map
-
         ce_map = ce_map * valid_mask
         if conf_weights is not None:
             ce_map = ce_map * conf_weights
         ce_loss = ce_map.sum() / (valid_mask.sum() + 1e-8)
 
-        # ── Online Hard Example Mining: boost loss on misclassified debris ──
-        with torch.no_grad():
-            preds = logits.argmax(dim=1)
-            debris_mask = (safe_target == 0) & (target != self.ignore_idx)
-            misclassified_debris = debris_mask & (preds != 0)
-            ohem_weight = torch.ones_like(valid_mask)
-            ohem_weight[misclassified_debris] = 3.0  # Extra penalty for missed debris
-        ce_loss_ohem = (ce_map * ohem_weight).sum() / (valid_mask.sum() + 1e-8)
-        ce_loss = 0.5 * ce_loss + 0.5 * ce_loss_ohem
+        pred_soft    = torch.softmax(logits, dim=1)
+        tversky_loss = self._tversky(pred_soft, target, logits.shape[1])
 
-        # ── Softmax probabilities ──
-        pred_soft = torch.softmax(logits, dim=1)
+        return self.ce_w * ce_loss + self.tversky_w * tversky_loss
 
-        # ── Dice loss (debris-weighted) ──
-        dice_loss = self._dice(pred_soft, target, logits.shape[1])
-
-        # ── Lovász-Softmax loss (classes='all' to always optimise debris even when not predicted) ──
-        lovasz_loss = lovasz_softmax(pred_soft, target, classes='all',
-                                     ignore_index=self.ignore_idx)
-
-        # ── Boundary-aware auxiliary loss ──
-        boundary_loss = self._boundary_loss(logits, target) if self.boundary_w > 0 else 0.0
-
-        return self.ce_w * ce_loss + self.dice_w * dice_loss + self.lovasz_w * lovasz_loss + self.boundary_w * boundary_loss
+    def forward(self, logits_or_tuple, target, conf_weights=None):
+        if isinstance(logits_or_tuple, tuple):
+            main_logits, aux_logits = logits_or_tuple
+            return (self._single_loss(main_logits, target, conf_weights)
+                    + self.aux_weight * self._single_loss(aux_logits, target, conf_weights))
+        return self._single_loss(logits_or_tuple, target, conf_weights)

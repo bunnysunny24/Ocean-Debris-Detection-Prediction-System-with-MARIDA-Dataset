@@ -1,12 +1,14 @@
 """
 Central configuration for the Marine Debris Detection & Drift Prediction Pipeline.
 Edit paths and hyperparameters here.
+
+GPU vs CPU is auto-detected at runtime. Settings below are tuned for both.
 """
 
 import os
+import torch
 
 # ─────────────────────────── PATHS ───────────────────────────
-# src/configs/config.py → src/ → project root
 BASE_DIR        = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR        = os.path.join(BASE_DIR, "Dataset")
 PATCHES_DIR     = os.path.join(DATA_DIR, "patches")
@@ -22,63 +24,77 @@ os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
+# ─────────────────────────── DEVICE AUTO-DETECT ──────────────
+_ON_GPU = torch.cuda.is_available()
+_DEVICE_NAME = torch.cuda.get_device_name(0) if _ON_GPU else "CPU"
+
 # ─────────────────────────── DATASET ─────────────────────────
-NUM_CLASSES   = 2           # Binary: debris vs. not-debris
+NUM_CLASSES   = 2
 RAW_BANDS     = 11          # Sentinel-2 bands (B10 excluded)
-USE_SPECTRAL_INDICES = True # Append NDVI, NDWI, FDI, PI, RNDVI as extra channels
-N_SPECTRAL_INDICES   = 5    # Number of spectral indices appended
-INPUT_BANDS   = RAW_BANDS + (N_SPECTRAL_INDICES if USE_SPECTRAL_INDICES else 0)  # 16 total
+USE_SPECTRAL_INDICES = True # NDVI, NDWI, FDI, PI, RNDVI
+N_SPECTRAL_INDICES   = 5
+INPUT_BANDS   = RAW_BANDS + (N_SPECTRAL_INDICES if USE_SPECTRAL_INDICES else 0)  # 16
 PATCH_SIZE    = 256
 
-CLASS_NAMES = {
-    0: "Debris",
-    1: "Not Debris",
-}
+CLASS_NAMES = {0: "Debris", 1: "Not Debris"}
 
-# Class weights — debris is only 0.45% of pixels, needs heavy upweighting
-CLASS_WEIGHTS = [15.0, 1.0]  # Debris (rare, upweighted 15x), Not Debris
+# Class weights — debris is ~0.45% of pixels
+CLASS_WEIGHTS = [5.0, 1.0]
 
 # ─────────────────────────── MODEL ───────────────────────────
-ENCODER_NAME  = "resnext50_32x4d"   # Options: resnext50_32x4d, resnext101_32x8d, efficientnet-b4
-# ENCODER_NAME  = "resnext101_32x8d"  # Uncomment for max capacity (2x params, needs ~12GB VRAM)
+# GPU: resnext101_32x8d for max capacity (~88M params, needs ≥8GB VRAM)
+# CPU: resnext50_32x4d for reasonable speed (~41M params)
+ENCODER_NAME = "resnext101_32x8d" if _ON_GPU else "resnext50_32x4d"
 
-# ─────────────────────────── TRAINING ────────────────────────
-
-## ── Tuned hyperparameters for best performance ──
-# Maximized for 39GB RAM, 8-thread CPU
-BATCH_SIZE   = 64           # Aggressive: max RAM usage for fastest CPU training
-EPOCHS       = 200          # Longer training for convergence
+# ─────────────────────────── TRAINING (auto-scaled) ──────────
+# Batch size: GPU gets larger real batch; CPU uses grad accumulation to compensate
+BATCH_SIZE   = 32  if _ON_GPU else 8
+NUM_WORKERS  = 8   if _ON_GPU else 4
+GRAD_ACCUM   = 2   if _ON_GPU else 4    # effective batch = BATCH_SIZE * GRAD_ACCUM = 64 both ways
+EPOCHS       = 200
 LR           = 1e-4
 WEIGHT_DECAY = 5e-5
-PATIENCE     = 50           # More patience for rare-class learning
-NUM_WORKERS  = 8            # Max for 8 CPU threads
-GRAD_ACCUM   = 2            # Gradient accumulation steps (effective batch = BATCH_SIZE * GRAD_ACCUM)
-EMA_DECAY    = 0.995        # EMA decay — lower to let rare-class signals propagate faster
-LABEL_SMOOTH = 0.02         # Mild label smoothing (was 0.05, too high for rare class)
-ENCODER_FREEZE_EPOCHS = 3   # Freeze encoder for first N epochs so decoder learns debris first
-FOCAL_GAMMA  = 1.0          # Reduced focal gamma — too high suppresses rare-class gradients
-USE_SWA      = True         # Stochastic Weight Averaging for better generalization
-SWA_START_EPOCH = 30        # Start SWA after this many epochs
-SWA_LR       = 5e-5         # SWA learning rate
+PATIENCE     = 50
+
+# ── EMA ──
+EMA_DECAY    = 0.9998
+
+# ── Encoder freeze warmup ──
+ENCODER_FREEZE_EPOCHS = 5
+
+# ── Loss ──
+FOCAL_GAMMA    = 3.0
+LABEL_SMOOTH   = 0.01
+TVERSKY_ALPHA  = 0.3   # FP weight (lower = accept more false alarms)
+TVERSKY_BETA   = 0.7   # FN weight (higher = strongly penalise missed debris)
+TVERSKY_WEIGHT = 0.7   # Tversky fraction of total loss
+AUX_LOSS_WEIGHT = 0.4  # Deep supervision auxiliary head weight
+
+# ── SWA (legacy, replaced by EMA) ──
+USE_SWA         = False
+SWA_START_EPOCH = 30
+SWA_LR          = 5e-5
 
 # ─────────────────────────── AUGMENTATION ────────────────────
-AUG_PROB          = 0.5
-ELASTIC_ALPHA     = 120
-ELASTIC_SIGMA     = 6
-SPECTRAL_NOISE    = 0.02
-BRIGHTNESS_RANGE  = (-0.1, 0.1)
-COPY_PASTE_PROB   = 0.7     # Copy-paste debris from donor patches (increased for more debris)
+AUG_PROB         = 0.5
+ELASTIC_ALPHA    = 120
+ELASTIC_SIGMA    = 6
+SPECTRAL_NOISE   = 0.02
+BRIGHTNESS_RANGE = (-0.1, 0.1)
+COPY_PASTE_PROB  = 0.4   # increased from 0.25
+MIXUP_PROB       = 0.15
+MIXUP_ALPHA      = 0.2
 
 # ─────────────────────────── OVERSAMPLING ────────────────────
-OVERSAMPLE_HEAVY  = 15      # Patches with >=20 debris pixels (increased)
-OVERSAMPLE_LIGHT  = 10      # Patches with 1-19 debris pixels (increased)
+OVERSAMPLE_HEAVY = 8
+OVERSAMPLE_LIGHT = 4
 
 # ─────────────────────────── POST-PROCESSING ─────────────────
-MIN_DEBRIS_PIXELS = 3       # keep tiny debris (real detections average ~8 px)
+MIN_DEBRIS_PIXELS = 3
 
 # ─────────────────────────── DRIFT ───────────────────────────
-DRIFT_HOURS       = 72      # total prediction horizon
-DRIFT_DT_SECONDS  = 900     # RK4 time step (15 min for higher accuracy)
-DRIFT_ENSEMBLE_N  = 200     # number of perturbed particles (larger ensemble)
-DRIFT_WIND_COEFF  = 0.035   # leeway: fraction of wind added to current
-STOKES_COEFF      = 0.016   # Stokes drift coefficient (wave-induced)
+DRIFT_HOURS      = 72
+DRIFT_DT_SECONDS = 900
+DRIFT_ENSEMBLE_N = 200
+DRIFT_WIND_COEFF = 0.035
+STOKES_COEFF     = 0.016

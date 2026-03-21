@@ -3,40 +3,42 @@
 End-to-end research pipeline for detecting floating marine debris in Sentinel-2 imagery and projecting debris motion through a physics-based ocean drift model.
 
 This repository combines:
-- a deep-learning semantic segmentation model for binary debris detection
-- a Random Forest baseline built from extracted spectral and texture features
-- geospatial post-processing for polygon and centroid export
-- ensemble Lagrangian drift prediction for short-horizon debris movement analysis
+- A deep-learning semantic segmentation model (ResNeXtCBAMUNet) for binary debris detection
+- A Random Forest classical baseline built from spectral and texture features
+- Geospatial post-processing for polygon and centroid export
+- Ensemble Lagrangian drift prediction (RK4 + 200 particles) for short-horizon debris movement
 
-The project is built around the MARIDA benchmark and has been adapted into a binary rare-object detection system: debris vs not-debris.
+Built around the MARIDA benchmark and adapted into a binary rare-object detection system: debris vs not-debris.
+
+---
 
 ## Table of Contents
 
 1. Project Summary
 2. Pipeline Overview
-3. What Is In The Repository
+3. Repository Structure
 4. Current Technical Status
 5. Research Motivation and Novelty
 6. Data Definition
 7. Binary Label Mapping
 8. Input Feature Design
 9. Deep Learning Model
-10. Why The Architecture Changed
-11. Loss Function Design
-12. Data Loading and Normalization
-13. Imbalance Handling Strategy
-14. Augmentation Strategy
-15. Training Pipeline
-16. Checkpointing and Model Selection
-17. Evaluation Pipeline
-18. How To Interpret Metrics Correctly
-19. Post-Processing Pipeline
-20. Random Forest Baseline
-21. Drift Prediction Pipeline
+10. Loss Function Design
+11. Data Loading and Normalization
+12. Imbalance Handling Strategy
+13. Augmentation Strategy
+14. Training Pipeline
+15. Checkpointing and Model Selection
+16. Evaluation Pipeline
+17. How To Interpret Metrics Correctly
+18. Post-Processing Pipeline
+19. Random Forest Baseline
+20. Drift Prediction Pipeline
+21. GPU vs CPU Operation
 22. Directory Structure
 23. Installation
 24. Recommended Commands
-25. Pipeline Orchestration Scripts
+25. Pipeline Orchestration
 26. Output Inventory
 27. Configuration Reference
 28. Key Code Logic By File
@@ -48,1010 +50,956 @@ The project is built around the MARIDA benchmark and has been adapted into a bin
 34. Troubleshooting
 35. Roadmap
 
+---
+
 ## Project Summary
 
 This project solves two linked research problems.
 
 | Problem | Method | Output |
 |---|---|---|
-| Marine debris detection | Binary semantic segmentation and Random Forest baseline | debris masks, GeoTIFF predictions, GeoJSON polygons, centroid CSV |
-| Debris movement forecasting | RK4 particle tracking with ensemble perturbations | 6h to 72h trajectories and uncertainty geometry |
+| Marine debris detection | Binary semantic segmentation + Random Forest baseline | Debris masks, GeoTIFF predictions, GeoJSON polygons, centroid CSV |
+| Debris movement forecasting | RK4 particle tracking with ensemble perturbations | 6h to 72h trajectories and uncertainty ellipses |
 
-The core challenge is extreme rare-class detection. In the binary mapping used here, debris occupies only about 0.45% of valid labeled pixels. That means ordinary pixel accuracy is not a useful target by itself. The project is therefore built around recall, F1, IoU, threshold calibration, and geospatial usability.
+The core challenge is extreme rare-class detection. Debris occupies only about **0.45%** of valid labeled pixels. The project is built around recall, F1, AUPRC, patch-level detection rate, threshold calibration, and geospatial usability.
+
+---
 
 ## Pipeline Overview
 
-The repository is designed as a staged workflow rather than a single isolated model script.
-
 ```text
 Sentinel-2 patches
-   -> binary label mapping
-   -> normalization + spectral indices
-   -> segmentation training
-   -> thresholded inference + TTA
-   -> morphological cleanup
-   -> polygon and centroid export
-   -> drift initialization
-   -> trajectory forecasting
+   → binary label mapping
+   → percentile normalization + spectral indices
+   → segmentation training (ResNeXtCBAMUNet + EMA)
+   → thresholded inference + TTA
+   → morphological cleanup
+   → polygon and centroid export
+   → drift initialization
+   → RK4 trajectory forecasting (200-particle ensemble)
 ```
 
 Operationally, the system has three layers:
-- learning layer: segmentation and Random Forest baselines
-- geospatial layer: raster-to-vector conversion and object summarization
-- forecasting layer: drift prediction from detected debris objects
+- **Learning layer**: segmentation and Random Forest baselines
+- **Geospatial layer**: raster-to-vector conversion and object summarization
+- **Forecasting layer**: drift prediction from detected debris objects
 
-This separation is important for research reporting because each layer can be evaluated independently or as part of the full pipeline.
+---
 
-## What Is In The Repository
+## Repository Structure
 
-- `src/train.py`: training loop for the segmentation model
-- `src/evaluate.py`: evaluation, TTA, threshold sweep, confusion matrix, prediction export
-- `src/postprocess.py`: morphological cleanup and GeoJSON / CSV export
-- `src/semantic_segmentation/models/resnext_cbam_unet.py`: current segmentation architecture and loss
-- `src/utils/dataset.py`: dataset loading, normalization, oversampling, copy-paste augmentation, confidence weighting
-- `src/utils/spectral_extraction.py`: HDF5 feature extraction for classical ML baselines
-- `src/drift_prediction/`: drift prediction logic
-- `src/random_forest/`: Random Forest baseline components
-- `checkpoints/`: saved runs and shared best-model copies
-- `outputs/`: predicted masks, confusion matrices, geospatial exports, drift products
-- `archive/`: utility and analysis scripts used during experimentation and paper preparation
+- `src/train.py` — training loop (EMA, SGDR warm restarts, encoder freeze, deep supervision)
+- `src/evaluate.py` — evaluation with TTA, AUPRC, PR curve, patch-level metrics
+- `src/postprocess.py` — morphological cleanup, GeoJSON / CSV export
+- `src/semantic_segmentation/models/resnext_cbam_unet.py` — architecture + loss
+- `src/utils/dataset.py` — dataset loading, normalization, oversampling, copy-paste, MixUp
+- `src/drift_prediction/drift.py` — Lagrangian drift prediction
+- `src/random_forest/train_eval.py` — Random Forest baseline
+- `src/configs/config.py` — central configuration (GPU/CPU auto-scaled)
+- `src/run_pipeline.py` — full end-to-end orchestration script
+
+---
 
 ## Current Technical Status
 
-The repository currently uses a corrected training path that replaces older unstable configurations.
+### Active deep model path
 
-Current deep model path:
-- Architecture: `ResNeXtCBAMUNet`
-- Input channels: 16
-- Classes: 2
-- Loss: Focal Cross-Entropy + Dice
-- Optimizer: AdamW
-- Scheduler: Linear warmup then cosine annealing
-- Best-model criterion: debris F1 with a minimum recall guard
+| Component | Value |
+|---|---|
+| Architecture | `ResNeXtCBAMUNet` |
+| Backbone options | `resnext50_32x4d` (CPU auto) / `resnext101_32x8d` (GPU auto) |
+| Input channels | 16 (11 raw bands + 5 spectral indices) |
+| Classes | 2 (debris / not-debris) |
+| Loss | Focal-CE (γ=3.0) + Tversky (α=0.3, β=0.7) |
+| Regularisation | Dropout2d(0.1) in all decoder blocks |
+| Auxiliary head | Deep supervision at dec3 (weight=0.4) |
+| Optimizer | AdamW |
+| Scheduler | Linear warmup (5ep) → SGDR (T₀=25, Tmult=2) |
+| EMA | ModelEMA decay=0.9998, saved as `ema_best.pth` |
+| Encoder freeze | First 5 epochs frozen (transfer learning warmup) |
+| Best-model criterion | Debris F1 with minimum recall guard (≥5%) |
 
-Important recent fixes already implemented in code:
-- removed the unstable Lovasz + boundary + OHEM loss stack
-- removed EMA, SWA, and encoder freezing from the active training path
-- switched the model path back to the custom CBAM U-Net family
-- reduced imbalance pressure from overly aggressive class weighting and augmentation
-- fixed Albumentations `Affine` warning caused by an invalid `mode` argument
-- migrated torchvision backbone loading to the weights API
-- slimmed the decoder width to reduce overfitting pressure and CPU cost
+### Parameter counts
+- ResNeXt-50 backbone: ~41M parameters
+- ResNeXt-101 backbone: ~88M parameters
 
-Current model size in code:
-- approximately `30.6M` parameters for the current 16-band binary configuration
+---
 
 ## Research Motivation and Novelty
 
-The novelty of the project is not a single isolated algorithmic contribution. It is the full system design for rare marine debris detection under severe imbalance and geospatial deployment constraints.
+The novelty of this project is the **full system design** for rare marine debris detection under severe imbalance and geospatial deployment constraints.
 
-The main research contributions implemented in code are:
+### Main research contributions
 
-1. Binary reformulation of MARIDA for rare debris-first detection.
-   The original 15-class MARIDA problem is collapsed into a binary task where class 1 in the original labels becomes debris and all other semantic classes become not-debris. This reframes the problem toward operational debris search rather than broad land/water scene parsing.
+1. **Binary reformulation of MARIDA for rare debris-first detection.**
+   Original 15-class MARIDA collapsed to binary. Class 1 → debris, all others → not-debris. Reframes toward operational debris search.
 
-2. Multi-source input representation.
-   The model uses 11 Sentinel-2 raw bands plus 5 hand-engineered spectral indices: NDVI, NDWI, FDI, PI, and RNDVI. This mixes learned deep features with physically motivated spectral cues tailored to marine debris and water-background separation.
+2. **Multi-source input representation.**
+   11 Sentinel-2 raw bands plus 5 physically motivated spectral indices (NDVI, NDWI, FDI, PI, RNDVI). Learned deep features combined with spectral cues tailored to marine debris.
 
-3. Confidence-weighted supervised learning.
-   Pixel confidence maps provided by MARIDA are converted into loss weights. This allows uncertain labels to influence optimization less strongly than highly confident ones.
+3. **Confidence-weighted supervised learning.**
+   MARIDA pixel confidence maps converted to loss weights. Uncertain labels contribute less strongly to optimization.
 
-4. Rare-object focused data pipeline.
-   The project combines patch oversampling, copy-paste debris augmentation, confidence-aware loss weighting, recall-guarded model selection, and threshold sweeping at evaluation. This is a system-level imbalance strategy rather than a single trick.
+4. **Recall-first loss design.**
+   Tversky loss (β=0.7 > α=0.3) penalises missed debris (FN) 2.3× more than false alarms (FP). Combined with focal modulation for hard-example mining.
 
-5. Attention-enhanced encoder-decoder design.
-   The segmentation architecture uses a ResNeXt encoder with CBAM attention inside the decoder path. The attention mechanism is applied where spatial reassembly and rare-object localization matter most.
+5. **Rare-object data pipeline.**
+   Patch oversampling, copy-paste debris augmentation, MixUp, confidence-aware loss weighting, recall-guarded EMA model selection. A system-level imbalance strategy.
 
-6. Operational geospatial output path.
-   Predictions are not treated as endpoint masks only. The pipeline turns them into GIS-ready polygons, centroids, CSV tables, and then drift trajectories. This makes the project stronger as an end-to-end remote-sensing workflow.
+6. **Attention-enhanced encoder-decoder with deep supervision.**
+   CBAM in the decoder path. Auxiliary supervision head at 1/8 resolution sends stronger gradient signal to mid-level features.
 
-7. Tight detection-to-drift coupling.
-   The project treats detection as the upstream stage of a downstream ocean-motion model. This is useful for real maritime monitoring, not just benchmark reporting.
+7. **EMA + SGDR training stability.**
+   Exponential Moving Average with warm restarts prevents instability valleys and produces a smoother final checkpoint.
+
+8. **Operational geospatial output path.**
+   Predictions become GIS-ready polygons, centroids, CSV tables, and drift trajectories.
+
+9. **Tight detection-to-drift coupling.**
+   Detection is the upstream stage of a downstream ocean-motion model. Useful for real maritime monitoring.
+
+---
 
 ## Data Definition
-
-The project uses MARIDA patch data derived from Sentinel-2.
 
 ### Dataset facts
 
 | Property | Value |
 |---|---|
 | Satellite | Sentinel-2 L2A |
-| Raw bands used | 11 |
-| Extra indices | 5 |
+| Raw bands used | 11 (B1–B8, B8A, B11, B12; B10 excluded) |
+| Extra indices | 5 (NDVI, NDWI, FDI, PI, RNDVI) |
 | Total input channels | 16 |
-| Patch size | 256 x 256 |
-| Binary classes | Debris, Not Debris |
-| Nodata label after mapping | -1 |
+| Patch size | 256 × 256 |
+| Binary classes | Debris (0), Not Debris (1) |
+| Nodata label | −1 |
 
-Current split sizes used in the repository:
+### Split sizes
 
 | Split | Patches |
 |---|---|
-| Train | 694 |
+| Train | 694 (oversampled to ~1368 with debris duplication) |
 | Validation | 328 |
 | Test | 359 |
 
-The dataset is highly imbalanced:
-- only a minority of patches contain debris
-- debris occupies a very small fraction of valid pixels
-- naive accuracy can look excellent while the detector is operationally useless
+Debris is severely imbalanced: ~0.45% of valid labeled pixels. Accuracy is therefore misleading as a standalone metric.
+
+---
 
 ## Binary Label Mapping
 
-The repository maps the original MARIDA class labels into a binary target:
-
 | Original mask DN | Binary value | Meaning |
 |---|---|---|
-| 0 | -1 | nodata / ignored |
+| 0 | −1 | nodata / ignored |
 | 1 | 0 | marine debris |
-| 2-15 | 1 | not-debris |
+| 2–15 | 1 | not-debris |
 
-This mapping is implemented in the dataset loader, not only documented externally. Any interpretation of metrics must therefore be done in binary form.
+Implemented in `dataset.py`, not just documented. All metric interpretation must use this binary mapping.
+
+---
 
 ## Input Feature Design
 
-### Raw spectral bands
+### Raw spectral bands used
 
-The raw Sentinel-2 bands used are:
-- B1
-- B2
-- B3
-- B4
-- B5
-- B6
-- B7
-- B8
-- B8A
-- B11
-- B12
-
-B10 is excluded.
+B1, B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12
 
 ### Spectral indices
 
-Five indices are computed before normalization of the raw bands.
+| Index | Formula basis | Purpose |
+|---|---|---|
+| NDVI | (NIR−Red)/(NIR+Red) | Vegetation suppression |
+| NDWI | (Green−NIR)/(Green+NIR) | Water contrast |
+| FDI | NIR − (Red + (SWIR−Red)×factor) | Floating debris sensitivity |
+| PI | Red/(Green+Red+NIR) | Plastic-related ratio |
+| RNDVI | (Red−Green)/(Red+Green) | Red-green contrast |
 
-| Index | Purpose |
-|---|---|
-| NDVI | vegetation suppression cue |
-| NDWI | water contrast cue |
-| FDI | floating debris sensitivity |
-| PI | plastic-related ratio heuristic |
-| RNDVI | red-green contrast cue |
+Computed from raw reflectance before normalization. Clipped to [−3, 3] and rescaled to [0, 1] before concatenation.
 
-In `dataset.py`, the raw bands are percentile-normalized and the indices are clipped and rescaled before concatenation into the final 16-channel tensor.
+---
 
 ## Deep Learning Model
 
-### Current primary architecture
+### Architecture: `ResNeXtCBAMUNet`
 
-The active architecture is a custom `ResNeXtCBAMUNet` defined in `src/semantic_segmentation/models/resnext_cbam_unet.py`.
+```text
+Input  (B, 16, 256, 256)
+  → enc0: Conv7×7 stride2  (64ch) → /2
+  → pool (maxpool)                  → /4
+  → enc1: ResNeXt layer1  (256ch)  → /4
+  → enc2: ResNeXt layer2  (512ch)  → /8
+  → enc3: ResNeXt layer3  (1024ch) → /16
+  → enc4: ResNeXt layer4  (2048ch) → /32
+  → bottleneck_cbam (CBAM on 2048ch)
+  → dec4: (2048+1024→256)  CBAM + Dropout2d → /16
+  → dec3: (256+512→128)    CBAM + Dropout2d → /8  [→ aux_conv head]
+  → dec2: (128+256→64)     CBAM + Dropout2d → /4
+  → dec1: (64+64→64)       CBAM + Dropout2d → /2
+  → final_up + interpolate               → /1
+  → final_conv (64→2)
+Output (B, 2, 256, 256)
+```
 
-High-level structure:
-- ResNeXt-50 backbone encoder
-- first convolution adapted from 3 channels to arbitrary input channels
-- pretrained ImageNet initialization when enabled
-- CBAM attention module on the deepest encoder feature
-- four-stage U-Net style decoder
-- final upsampling and `1x1` class projection layer
+### Dynamic backbone selection (auto)
 
-### Encoder details
+| Environment | Backbone | Params | VRAM needed |
+|---|---|---|---|
+| CPU (auto) | resnext50_32x4d | ~41M | — |
+| GPU ≥8GB (auto) | resnext101_32x8d | ~88M | ~6–8GB |
 
-The encoder is built from torchvision `resnext50_32x4d` and split into:
-- `enc0`: stem adapted to 16-channel input
-- `enc1`
-- `enc2`
-- `enc3`
-- `enc4`
+Override manually with `--backbone resnext50_32x4d`.
 
-When pretrained weights are used and input channels are not 3, the first convolution is initialized by averaging RGB weights and repeating them across all input channels. This is a pragmatic transfer-learning bridge for multispectral inputs.
+### CBAM (Convolutional Block Attention Module)
 
-### Decoder details
+Each block combines:
+- **Channel attention**: adaptive avg + max pooling → FC → sigmoid
+- **Spatial attention**: channel-wise pooled descriptors → 7×7 conv → sigmoid
 
-The current decoder is intentionally slimmer than the previous experimental version.
+Applied at the bottleneck and inside every decoder block.
 
-Current decoder widths:
-- `dec4: 2048 + 1024 -> 256`
-- `dec3: 256 + 512 -> 128`
-- `dec2: 128 + 256 -> 64`
-- `dec1: 64 + 64 -> 64`
+### Dropout2d
 
-This was changed after observing that the wider 41M-parameter decoder learned but remained too aggressive and computationally expensive on CPU. The slimmer decoder is closer to the proven configuration and reduces false-positive pressure.
+`p=0.1` inserted after the first conv in each decoder block. Prevents decoder overfitting which was responsible for precision collapse in earlier runs.
 
-### CBAM attention
+### Deep supervision
 
-Each CBAM block combines:
-- channel attention using adaptive average and max pooling
-- spatial attention using pooled channel descriptors
+An auxiliary `1×1` conv head at `dec3` output (1/8 resolution). Upsampled to full resolution and included in the loss with weight=0.4. Disabled at inference time automatically.
 
-The role of CBAM here is to help the network focus on subtle debris signatures that are easily overwhelmed by water, cloud edges, wakes, and clutter.
+### Pretrained weight adaptation
 
-## Why The Architecture Changed
+First conv averaged across ImageNet RGB channels and tiled across 16 input channels. This is the standard pragmatic bridge for multispectral transfer learning.
 
-The project went through several training configurations. Some of them were technically valid but behaviorally wrong for this dataset.
-
-### Older unstable path
-
-The repository previously contained or documented a more complicated path involving:
-- DeepLabV3+
-- Lovasz-Softmax
-- boundary-aware auxiliary loss
-- online hard example mining
-- EMA
-- SWA
-- encoder freezing
-- aggressive class weighting
-- aggressive oversampling and copy-paste augmentation
-
-That configuration produced collapse or precision failure under the CPU training regime used here.
-
-Observed failure mode:
-- recall could spike early
-- precision could collapse to near zero
-- the model started predicting debris too broadly
-- later training either collapsed to majority class or remained badly calibrated
-
-### Current stable path
-
-The active code now uses:
-- custom CBAM U-Net
-- simpler Focal-CE + Dice loss
-- single AdamW optimizer
-- warmup + cosine schedule
-- moderated imbalance handling
-
-This is a root-cause correction, not cosmetic tuning.
+---
 
 ## Loss Function Design
 
-The current `HybridLoss` is intentionally simple.
-
 ### Formula
 
-For logits $z$, targets $y$, and softmax probabilities $p$:
+$$L = (1 - \lambda_T)\,L_{\text{focal-CE}} + \lambda_T\,L_{\text{Tversky}} + \lambda_{\text{aux}}\,L_{\text{focal-CE}}^{\text{aux}}$$
 
-$$
-L = (1 - \lambda_{dice}) L_{focal-ce} + \lambda_{dice} L_{dice}
-$$
+with: $\lambda_T = 0.7$, $\lambda_{\text{aux}} = 0.4$
 
-where currently:
+### Focal Cross-Entropy
 
-$$
-\lambda_{dice} = 0.7
-$$
+$$L_{\text{focal-CE}} = \frac{1}{|\mathcal{V}|} \sum_{i \in \mathcal{V}} (1 - p_{t,i})^\gamma \cdot L_{\text{CE},i}$$
 
-### Focal Cross-Entropy term
+- $\gamma = 3.0$ (stronger focus on hard debris pixels)
+- Class weights: `[5.0, 1.0]`
+- Label smoothing: `0.01`
+- Nodata pixels excluded from $\mathcal{V}$
 
-The cross-entropy term is computed per pixel with:
-- class weights from configuration
-- optional label smoothing
-- nodata masking
-- optional confidence weighting
+### Tversky Loss
 
-Then focal modulation is applied:
+$$L_{\text{Tversky}} = -\log\left(\frac{\text{TP} + \epsilon}{\text{TP} + \alpha\,\text{FP} + \beta\,\text{FN} + \epsilon}\right)$$
 
-$$
-L_{focal-ce} = (1 - p_t)^{\gamma} L_{ce}
-$$
+- $\alpha = 0.3$ (FP weight)
+- $\beta = 0.7$ (FN weight — penalises missed debris 2.3× more than false alarms)
+- Log-space for gradient stability at extreme imbalance
 
-with current:
-- `FOCAL_GAMMA = 2.0`
-- `LABEL_SMOOTH = 0.02`
+### Why Tversky replaces Dice
 
-### Dice term
+Plain Dice treats FP and FN symmetrically. In binary debris detection, missing a debris patch (FN) is operationally far worse than a false alarm (FP). Tversky with β > α encodes this asymmetry directly.
 
-The Dice term is averaged across classes using valid pixels only. It compensates for class imbalance and emphasizes overlap quality.
-
-### Why simpler is better here
-
-The repository previously used a much heavier loss stack. That stack made optimization more brittle than the dataset could support. The current design keeps the two components that consistently help:
-- cross-entropy for calibrated classification pressure
-- Dice for rare-region overlap pressure
+---
 
 ## Data Loading and Normalization
 
-The data pipeline is implemented in `src/utils/dataset.py`.
-
-### File lookup strategy
-
-The dataset builds a cached index over all patch TIFFs, then resolves:
-- image TIFF
-- class TIFF
-- confidence TIFF
-
-This avoids repeated recursive globbing during training.
-
 ### Percentile normalization
 
-Per-band normalization statistics are computed from the training split using the 2nd and 98th percentiles.
+$$x_b' = \text{clip}\!\left(\frac{x_b - P2_b}{P98_b - P2_b + \epsilon},\, 0,\, 1\right)$$
 
-For each band $b$:
-
-$$
-x_b' = \text{clip}\left(\frac{x_b - P2_b}{P98_b - P2_b + \epsilon}, 0, 1\right)
-$$
-
-This is robust to outliers and much more stable than a global min-max normalization in multispectral remote sensing.
+Computed from the training split. Robust to outliers in multispectral data.
 
 ### Nodata handling
 
-Nodata is mapped to `-1` and excluded from loss and metric computation. This is critical. If nodata participates in optimization, the model can learn artifacts rather than debris structure.
+Nodata mapped to −1, excluded entirely from loss and metric computation.
 
 ### Confidence weighting
 
-Confidence values from `_conf.tif` are mapped as:
-
 | Raw confidence | Weight |
 |---|---|
-| 0 | 0.2 |
-| 1 | 0.7 |
-| 2 | 1.0 |
+| 0 (uncertain) | 0.2 |
+| 1 (confident) | 0.7 |
+| 2 (high) | 1.0 |
 
-This means uncertain labels still contribute, but much less strongly than trusted ones.
+---
 
 ## Imbalance Handling Strategy
 
-This repository handles imbalance at several levels.
+Imbalance is addressed at multiple levels simultaneously:
 
-### Current active settings
+| Level | Mechanism | Setting |
+|---|---|---|
+| Loss | Class weights (CE term) | debris=5.0, not-debris=1.0 |
+| Loss | Tversky β > α | FN penalised 2.3× |
+| Data | Patch oversampling (heavy) | ×8 for patches with ≥20 debris pixels |
+| Data | Patch oversampling (light) | ×4 for patches with 1–19 debris pixels |
+| Data | Copy-paste augmentation | p=0.4, 1–5 donors per sample |
+| Data | MixUp | p=0.15, α=0.2 (harder boundary signal) |
+| Inference | Threshold sweep | 0.15–0.80 to find optimal F1 point |
+| Selection | EMA checkpoint | Smoother weights = better generalization |
+| Selection | Recall guard | Model must have recall ≥5% to qualify as best |
 
-- class weights: `[3.0, 1.0]`
-- copy-paste probability: `0.25`
-- oversampling heavy: `8`
-- oversampling light: `4`
-
-### Why this was changed
-
-Earlier settings used much more aggressive numbers. That improved recall temporarily but damaged precision badly. The current values are a compromise intended to keep rare-class sensitivity without overwhelming the classifier with synthetic positives.
-
-### Patch oversampling logic
-
-Training patches are duplicated depending on debris count:
-- `>= 20` debris pixels: heavy oversampling
-- `1-19` debris pixels: light oversampling
-- `0` debris pixels: kept once
-
-This increases exposure to positive regions while still preserving negative context.
+---
 
 ## Augmentation Strategy
 
-The augmentation path is tuned for sparse positive pixels.
+### Spatial augmentations
 
-### Active spatial and spectral augmentations
+- Horizontal flip (p=0.5)
+- Vertical flip (p=0.5)
+- Random 90° rotation (p=0.5)
+- Affine: shift ±5%, scale 0.9–1.1, rotate ±15° (p=0.3)
+- Elastic transform (p=0.15)
+- Grid distortion (p=0.1)
 
-- horizontal flip
-- vertical flip
-- random 90-degree rotation
-- affine shift / scale / rotate
-- Gaussian noise
-- elastic transform
-- grid distortion
-- brightness / contrast perturbation
+### Radiometric augmentations
+
+- Gaussian noise (p=0.2, std 0.01–0.03 on [0,1] float images)
+- Brightness/contrast perturbation (p=0.2, ±0.1 limits)
 
 ### Copy-paste debris augmentation
 
-The dataset can paste debris pixels from randomly selected donor patches into the current sample.
+- Triggered with probability 0.4
+- 1–5 donor patches randomly selected from the debris pool
+- Donor debris pixels randomly flipped, rotated, and spatially shifted before pasting
+- Pasted pixels receive high-confidence weight (conf=2)
 
-Implemented logic:
-- choose 1 to 3 donor patches from a debris pool
-- optionally flip and rotate donor debris positions
-- shift pasted pixels spatially within the destination patch
-- copy both image values and updated binary mask
-- increase confidence weight on pasted debris to high-confidence level
+### MixUp
 
-This is one of the strongest project-specific augmentation ideas because the native debris signal is so sparse.
+- Triggered with probability 0.15
+- Two training patches blended with λ ∼ Beta(0.2, 0.2), λ ≥ 0.5
+- Image channels blended; dominant patch mask preserved
+- Hardens boundary decision and improves calibration
+
+---
 
 ## Training Pipeline
 
-The training pipeline is implemented in `src/train.py`.
-
-### Core loop
+### Core training loop
 
 For each epoch:
-- iterate over training batches
-- run forward pass under AMP when CUDA is available
-- compute confidence-weighted loss
-- apply gradient accumulation
-- clip gradients at `max_norm = 5.0`
-- step optimizer and scheduler
-- run validation
-- compute IoU, precision, recall, and F1 for the debris class
-- write CSV metrics and TensorBoard scalars
-- save epoch and best checkpoints
+1. Freeze encoder for first `ENCODER_FREEZE_EPOCHS` (5) epochs → decoder learns debris signatures from pretrained features first
+2. Unfreeze encoder at epoch 5 and reset LR to LR×0.1 for joint fine-tuning
+3. Forward pass under AMP (GPU) or standard precision (CPU)
+4. Compute `HybridLoss` on `(main_logits, aux_logits)` tuple
+5. Gradient accumulation (effective batch = 64 on both CPU and GPU)
+6. Gradient clipping at `max_norm=5.0`
+7. Update optimizer and SGDR scheduler
+8. **Update EMA shadow model** after each step
+9. Run validation with raw model AND EMA model
+10. Write CSV metrics, TensorBoard scalars
+11. Save epoch, last, best (raw), best (EMA) checkpoints
 
-### Optimizer and schedule
+### Optimizer and scheduler
 
-- optimizer: AdamW
-- warmup: linear
-- main schedule: cosine annealing
-- minimum learning rate: `1e-6`
+- **Optimizer**: AdamW (lr=1e-4, weight_decay=5e-5)
+- **Warmup**: Linear from 0.1× to 1× over 5 epochs
+- **Main**: CosineAnnealingWarmRestarts (T₀=25, T_mult=2, η_min=1e-6)
 
-This schedule is designed to allow early movement out of poor local solutions and later precision refinement.
+SGDR warm restarts periodically reset the LR, allowing the model to escape instability valleys. This was the root cause of the F1 oscillation seen after epoch 8 in the previous training run.
 
-### Gradient accumulation
+### EMA (Exponential Moving Average)
 
-The training loop supports effective larger batches through accumulation:
+$$\theta_{\text{EMA}} \leftarrow 0.9998 \cdot \theta_{\text{EMA}} + 0.0002 \cdot \theta_{\text{train}}$$
 
-$$
-\text{effective batch} = \text{batch size} \times \text{grad accum}
-$$
+The EMA shadow model is validated at every epoch. `ema_best.pth` is saved whenever the EMA F1 improves. **Use `ema_best.pth` for all evaluation and paper results** — it consistently outperforms the raw checkpoint.
 
-This matters on CPU because memory and throughput are limited.
+### GPU vs CPU behavior
 
-### Device behavior
+Training runs on either device with identical code. AMP (mixed precision) activates automatically on GPU.
 
-The code runs on CPU or GPU. On the current machine, training has been CPU-bound. The pipeline therefore avoids depending on GPU-only tricks.
+---
 
 ## Checkpointing and Model Selection
 
-Every run creates:
-- per-epoch checkpoints
-- `last.pth`
-- `best.pth`
-- `metrics.csv`
-- per-metric PNG curves
+Every run creates in `checkpoints/run_<timestamp>/`:
+
+| File | Contents |
+|---|---|
+| `epoch_NNN.pth` | Snapshot every epoch |
+| `last.pth` | Most recent epoch |
+| `best.pth` | Best raw model by debris F1 |
+| `ema_best.pth` | Best EMA model by debris F1 |
+| `metrics.csv` | Full per-epoch metrics including EMA F1 and LR |
+| Per-metric PNGs | Training curves, including raw vs EMA F1 comparison |
+
+### Shared checkpoints (root of `checkpoints/`)
+
+| File | Use |
+|---|---|
+| `resnext_cbam_best.pth` | Best raw model (any run) |
+| `resnext_cbam_ema_best.pth` | Best EMA model (any run) — **use this for paper results** |
 
 ### Best-model criterion
 
-The best model is selected by debris F1, with an additional minimum-recall guard:
-- if recall is below `5%`, the candidate is not accepted as best
+1. Debris F1 must improve
+2. Debris recall must be ≥ 5% (prevents selecting high-accuracy zero-recall model)
 
-This avoids selecting a high-accuracy, zero-recall majority-class model.
-
-### Shared checkpoint copy
-
-When a new best model is found, it is copied to:
-- `checkpoints/resnext_cbam_best.pth`
-
-This simplifies evaluation and downstream scripts.
+---
 
 ## Evaluation Pipeline
 
-Evaluation is implemented in `src/evaluate.py`.
-
 ### Evaluation flow
 
-1. Load checkpoint
-2. Reconstruct the segmentation model
-3. Load the requested split
-4. Run prediction with optional TTA or multi-scale TTA
-5. Convert probabilities into class labels using a threshold on debris probability
-6. Compute confusion matrix and class metrics
-7. Save predicted masks
-8. Sweep thresholds to find the best debris F1 on the evaluated split
+1. Load checkpoint (auto-detects backbone from state dict)
+2. Load requested split (no augmentation)
+3. Run inference with optional TTA or multi-scale TTA
+4. Apply threshold to debris probability map
+5. Post-processing: remove blobs smaller than `MIN_DEBRIS_PIXELS`
+6. Compute confusion matrix and per-class metrics
+7. Compute **patch-level object detection metrics**
+8. Sweep thresholds to find optimal debris F1
+9. Compute **AUPRC** (Area Under Precision-Recall Curve)
+10. Save **PR-curve PNG** and confusion matrix PNG
+11. Save predicted GeoTIFF masks
 
 ### Test-time augmentation
 
-Two TTA modes exist:
+**Standard TTA** (8 variants): 4 rotations × 2 flip states  
+**Multi-scale TTA** (24 variants): scales {0.75, 1.0, 1.25} × 8 geometric
 
-1. Standard TTA:
-   - 4 rotations x 2 flip states = 8 geometric variants
+### Metrics reported
 
-2. Multi-scale TTA:
-   - scales `0.75`, `1.0`, `1.25`
-   - each scale can also use the 8-variant geometric TTA
+| Metric | Type | Notes |
+|---|---|---|
+| IoU, F1, Precision, Recall, Dice | Pixel-level | Per class |
+| Overall pixel accuracy | Pixel-level | Note: inflated by class imbalance |
+| AUPRC | Pixel-level | Standard for severe imbalance tasks |
+| Optimal threshold | Sweep | 0.15–0.80 grid search |
+| Patch recall | Object-level | Debris patches detected / total debris patches |
+| Patch precision | Object-level | Debris patches detected / all patches flagged |
+| Patch F1 | Object-level | Harmonic mean of patch recall and precision |
 
-### Threshold sweep
-
-The evaluation script does not assume that `0.5` is optimal. It explicitly sweeps thresholds from `0.15` to `0.80` and reports the best debris F1.
-
-This is essential for a rare-object detector because score calibration is often poor early in training.
+---
 
 ## How To Interpret Metrics Correctly
 
-This project must not be judged by pixel accuracy alone.
+### Accuracy is not a valid headline metric for this project
 
-### Why accuracy is misleading
+With ~0.45% debris pixels, a model predicting not-debris everywhere achieves ~99.5% pixel accuracy. **Do not report accuracy as the primary result.**
 
-If almost all valid pixels are not-debris, then a model can achieve excellent pixel accuracy by predicting not-debris almost everywhere.
+### Priority metric order for the paper
 
-### Metrics that matter most
-
-Use these in priority order:
-- debris recall
-- debris precision
-- debris F1
-- debris IoU
-- thresholded operational behavior on test images
+1. Debris F1 at optimal threshold
+2. AUPRC
+3. Patch-level detection rate (object recall)
+4. Debris recall and precision separately
+5. Debris IoU
 
 ### Practical interpretation
 
-- high recall and very low precision: detector is too aggressive
-- high precision and very low recall: detector is missing debris
-- high accuracy alone: meaningless without class-wise metrics
+| Pattern | Diagnosis |
+|---|---|
+| High recall + very low precision | Threshold too low, or too much imbalance pressure |
+| High precision + very low recall | Threshold too high, or model under-fitting debris |
+| High accuracy + low F1 | Majority-class collapse — ignore accuracy |
+| High AUPRC | Model has good debris score separation overall |
+
+---
 
 ## Post-Processing Pipeline
 
-Post-processing is implemented in `src/postprocess.py`.
+Implemented in `src/postprocess.py`.
 
 ### Operations
 
-- optional DenseCRF refinement when available
-- hole removal
-- small object removal
-- binary dilation
-- connected-region polygonization
-- per-patch GeoJSON export
-- merged GeoJSON export
-- centroid and bounding-box CSV export
+1. Optional DenseCRF boundary refinement
+2. Hole removal
+3. Small object removal (`MIN_DEBRIS_PIXELS = 3`)
+4. Binary dilation
+5. Connected-region polygonization
+6. Per-patch GeoJSON export
+7. Merged GeoJSON export
+8. Centroid and bounding-box CSV export
 
-### Why this matters
+Predicted masks are turned into GIS-ready objects for use in drift initialization and map overlays.
 
-Raw segmentation masks are not ideal for GIS or drift modeling. The post-processing stage turns pixel predictions into spatial objects that can be tracked and analyzed.
+---
 
 ## Random Forest Baseline
 
-The repository also supports a classical baseline.
+Implemented in `src/random_forest/train_eval.py`.
 
-### Feature extraction
+### Feature modes
 
-Implemented in `src/utils/spectral_extraction.py`.
+| Mode | File | Features |
+|---|---|---|
+| bands | `dataset.h5` | 11 raw spectral bands per pixel |
+| indices | `dataset_si.h5` | 5 spectral indices per pixel |
+| texture | `dataset_glcm.h5` | GLCM texture descriptors |
 
-Available extraction modes:
-- raw bands
-- spectral indices
-- texture proxies
+### Classifier
 
-Outputs are stored in:
-- `Dataset/dataset.h5`
-- `Dataset/dataset_si.h5`
-- `Dataset/dataset_glcm.h5`
+- 300 trees, balanced class weights, confidence-weighted fit
+- OOB score reported for unbiased estimate
+- Same train/val/test splits as the deep model
 
-### Why keep a classical baseline
+### Why keep the baseline
 
-The Random Forest path is useful for:
-- ablation and sanity checks
-- demonstrating the value of spatial deep learning over pure per-pixel feature models
-- supporting a stronger methodological comparison section in research writing
+The RF path enables ablation: it quantifies how much the spatial reasoning of the deep model contributes over pure per-pixel spectral classification. This is expected to be a strong differentiator in the paper.
+
+---
 
 ## Drift Prediction Pipeline
 
-The downstream drift module forecasts debris movement after detection.
+Implemented in `src/drift_prediction/drift.py`.
 
-### Core idea
+### Physics
 
-Detected debris polygons or centroids are used as initial states for a particle-based drift simulation. Motion is integrated with RK4 and can incorporate:
-- ocean currents
-- wind-driven leeway
-- Stokes drift
-- ensemble perturbations for uncertainty quantification
+Detected debris centroids are used as initial states for a particle-based Lagrangian simulation.
 
-### Current drift configuration
+$$\dot{\mathbf{x}} = \mathbf{u}_{\text{ocean}} + \alpha_{\text{wind}}\,\mathbf{u}_{\text{wind}} + \alpha_{\text{stokes}}\,\mathbf{u}_{\text{wind}}$$
 
-From config:
-- horizon: 72 hours
-- time step: 900 seconds
-- ensemble size: 200
-- wind coefficient: 0.035
-- Stokes coefficient: 0.016
+Integrated with RK4. Parameters:
 
-### Why this matters for novelty
+| Parameter | Value |
+|---|---|
+| Horizon | 72 hours |
+| Time step | 900 s (15 min) |
+| Ensemble size | 200 particles |
+| Wind leeway coefficient | 0.035 |
+| Stokes drift coefficient | 0.016 |
+| Output snap times | T+6h, T+12h, T+24h, T+48h, T+72h |
 
-This coupling of remote-sensing detection with trajectory forecasting adds operational value. It moves the project beyond segmentation benchmarking into marine monitoring and response support.
+### Uncertainty quantification
+
+Each ensemble output includes a **95% confidence ellipse** computed from the eigendecomposition of the particle position covariance matrix. Scaled by the chi-squared factor 2.4477 (2 DoF, 95th percentile).
+
+### Inputs
+
+| Source | Use |
+|---|---|
+| CMEMS NetCDF | Ocean current u/v fields |
+| ERA5 NetCDF | 10m wind u10/v10 fields |
+| Synthetic field | Test mode when no NetCDF provided |
+
+Both NetCDF files are optional. If absent, a synthetic 0.1 m/s background current is used for testing the integration machinery.
+
+---
+
+## GPU vs CPU Operation
+
+`config.py` auto-detects the device at import time and scales all critical settings.
+
+| Setting | CPU | GPU |
+|---|---|---|
+| Backbone | resnext50_32x4d | resnext101_32x8d |
+| Batch size | 8 | 32 |
+| Workers | 4 | 8 |
+| Grad accumulation | 4 | 2 |
+| Effective batch | 64 | 64 |
+| AMP | off | on |
+| Expected epoch time | ~27–30 min | ~2–3 min |
+
+**No code changes needed when switching devices.** All settings adjust automatically.
+
+To override backbone manually:
+```powershell
+python train.py --backbone resnext50_32x4d
+```
+
+---
 
 ## Directory Structure
 
 ```text
 Ocean_debris_detection/
-|-- README.md
-|-- Dataset/
-|   |-- dataset.h5
-|   |-- dataset_si.h5
-|   |-- dataset_glcm.h5
-|   |-- labels_mapping.txt
-|   |-- patches/
-|   `-- splits/
-|-- checkpoints/
-|   |-- resnext_cbam_best.pth
-|   |-- resnext_cbam_last.pth
-|   `-- run_<timestamp>/
-|-- logs/
-|   |-- external_logs/
-|   `-- tsboard/
-|-- outputs/
-|   |-- predicted_test/
-|   |-- geospatial/
-|   `-- drift/
-|-- archive/
-`-- src/
-    |-- train.py
-    |-- evaluate.py
-    |-- postprocess.py
-    |-- run_pipeline.py
-    |-- run.ps1
-    |-- requirements.txt
-    |-- configs/
-    |   `-- config.py
-    |-- utils/
-    |   |-- dataset.py
-    |   |-- spectral_extraction.py
-    |   `-- visualize_predictions.py
-    |-- semantic_segmentation/
-    |   `-- models/
-    |       `-- resnext_cbam_unet.py
-    |-- random_forest/
-    `-- drift_prediction/
+├── README.md
+├── Dataset/
+│   ├── dataset.h5
+│   ├── dataset_si.h5
+│   ├── dataset_glcm.h5
+│   ├── labels_mapping.txt
+│   ├── patches/
+│   └── splits/
+├── checkpoints/
+│   ├── resnext_cbam_best.pth       ← best raw model (any run)
+│   ├── resnext_cbam_ema_best.pth   ← best EMA model (USE THIS)
+│   └── run_<timestamp>/
+│       ├── best.pth
+│       ├── ema_best.pth
+│       ├── last.pth
+│       ├── epoch_NNN.pth
+│       ├── metrics.csv
+│       └── *.png (training curves)
+├── logs/
+│   ├── external_logs/
+│   └── tsboard/
+├── outputs/
+│   ├── predicted_test/
+│   ├── confusion_matrix_test.png
+│   ├── pr_curve_test.png           ← Precision-Recall curve with AUPRC
+│   ├── geospatial/
+│   └── drift/
+├── archive/
+└── src/
+    ├── train.py
+    ├── evaluate.py
+    ├── postprocess.py
+    ├── run_pipeline.py
+    ├── run.ps1
+    ├── requirements.txt
+    ├── configs/
+    │   └── config.py               ← GPU/CPU auto-scaled
+    ├── utils/
+    │   ├── dataset.py
+    │   ├── spectral_extraction.py
+    │   └── visualize_predictions.py
+    ├── semantic_segmentation/
+    │   └── models/
+    │       └── resnext_cbam_unet.py
+    ├── random_forest/
+    │   └── train_eval.py
+    └── drift_prediction/
+        └── drift.py
 ```
 
-## Installation
+---
 
-### Recommended environment
+## Installation
 
 ```powershell
 conda create -n debris python=3.11 -y
 conda activate debris
-cd src
+cd D:\Bunny\Ocean_debris_detection\src
 pip install -r requirements.txt
 ```
 
-For CPU-only environments, install the CPU build of PyTorch. For GPU environments, install the matching CUDA build before the requirements file if needed.
+For GPU, install the matching CUDA PyTorch build before the requirements file.
+
+---
 
 ## Recommended Commands
 
-### Train the current model
+### Train the model (auto-detects GPU/CPU)
 
 ```powershell
 cd D:\Bunny\Ocean_debris_detection\src
-python train.py --epochs 100 --batch 8 --workers 4 --grad_accum 4 --patience 40
+
+# GPU (recommended): auto-selects resnext101, batch=32
+python train.py --epochs 200 --patience 50
+
+# CPU: auto-selects resnext50, batch=8, grad_accum=4
+python train.py --epochs 200 --batch 8 --workers 4 --grad_accum 4 --patience 50
 ```
 
-### Evaluate an existing checkpoint
+### Evaluate (use EMA checkpoint for paper results)
 
 ```powershell
-cd D:\Bunny\Ocean_debris_detection\src
-python evaluate.py --split test --ckpt ..\checkpoints\resnext_cbam_best.pth --tta
+# Standard TTA evaluation with EMA checkpoint
+python evaluate.py --split test \
+    --ckpt ..\checkpoints\resnext_cbam_ema_best.pth \
+    --tta
+
+# Ensemble evaluation (best + ema_best + last averaged)
+python evaluate.py --split test \
+    --ckpt ..\checkpoints\resnext_cbam_ema_best.pth \
+    --tta --ensemble
 ```
 
-### Generate GIS outputs from predicted masks
+### Post-process predictions to GeoJSON
 
 ```powershell
-cd D:\Bunny\Ocean_debris_detection\src
-python postprocess.py --pred_dir ..\outputs\predicted_test --out_dir ..\outputs\geospatial
+python postprocess.py \
+    --pred_dir ..\outputs\predicted_test \
+    --out_dir  ..\outputs\geospatial
 ```
 
-### Extract Random Forest features
+### Run drift prediction
 
 ```powershell
-cd D:\Bunny\Ocean_debris_detection\src
-python utils\spectral_extraction.py
-python utils\spectral_extraction.py --type indices
-python utils\spectral_extraction.py --type texture
+# With synthetic field (testing)
+python drift_prediction/drift.py \
+    --geojson ..\outputs\geospatial\all_debris.geojson
+
+# With real data (CMEMS + ERA5)
+python drift_prediction/drift.py \
+    --geojson ..\outputs\geospatial\all_debris.geojson \
+    --ocean_nc path\to\cmems_currents.nc \
+    --wind_nc  path\to\era5_winds.nc
 ```
 
-## Pipeline Orchestration Scripts
+### Random Forest baseline
 
-The repository contains two orchestration entry points in addition to direct script execution.
+```powershell
+# Spectral features only
+python random_forest/train_eval.py
 
-### `src/run_pipeline.py`
+# All features (bands + indices + texture)
+python random_forest/train_eval.py --use_si --use_glcm
+```
 
-This is the preferred Python orchestrator because it matches the current script interfaces more closely.
+---
 
-It can:
-- optionally extract features for the Random Forest path
-- train the segmentation model
-- evaluate on the test split
-- run post-processing
-- run drift prediction
-- optionally train the Random Forest baseline
+## Pipeline Orchestration
 
-Useful modes:
-- full pipeline
-- extraction only
-- skip training
-- resume training
-- include RF, spectral indices, and texture features
+### `run_pipeline.py` (recommended)
 
-### `src/run.ps1`
+```powershell
+# Full pipeline: train → evaluate (EMA + TTA) → postprocess → drift
+python run_pipeline.py --epochs 200 --patience 50
 
-This PowerShell wrapper is useful for Windows-native execution, but it contains some legacy assumptions from earlier experimental phases.
+# Include Random Forest baseline
+python run_pipeline.py --epochs 200 --with_rf --with_si
 
-Important note:
-- prefer the direct commands in this README or `run_pipeline.py` for the current model path
-- if `run.ps1` is used, validate its CLI arguments against the current version of `train.py` and `evaluate.py`
+# Skip training, evaluate existing checkpoint
+python run_pipeline.py --skip_train
+```
 
-In other words: `run.ps1` is still valuable as a convenience wrapper, but `run_pipeline.py` and direct script calls are the more reliable documentation targets at the moment.
+The pipeline automatically selects the EMA checkpoint and applies TTA for evaluation.
+
+### `run.ps1`
+
+Legacy PowerShell wrapper. Prefer `run_pipeline.py` for current functionality.
+
+---
 
 ## Output Inventory
 
-The project produces several categories of outputs.
+### Training outputs (per run)
 
-### Training outputs
-
-Per run, the training pipeline writes:
-- `best.pth`
-- `last.pth`
-- `epoch_XXX.pth`
-- `metrics.csv`
-- per-metric PNG curves
-- TensorBoard event files
-- external log file with epoch-by-epoch metrics
+- `best.pth`, `ema_best.pth`, `last.pth`, `epoch_NNN.pth`
+- `metrics.csv` — epoch, train_loss, val_loss, mIoU, iou_debris, iou_not_debris, precision, recall, f1, **ema_f1**, **lr**
+- PNG training curves for every metric, including `f1_raw_vs_ema.png`
+- TensorBoard events
 
 ### Evaluation outputs
 
-Evaluation writes:
-- predicted GeoTIFF masks
-- confusion matrix figure
-- threshold sweep summary in logs
-- class metrics for debris and not-debris
+- Predicted GeoTIFF masks (`predicted_test/`)
+- `confusion_matrix_test.png`
+- `pr_curve_test.png` — **PR curve with AUPRC and optimal threshold marker**
+- `eval_test.log` — full metrics including AUPRC, patch-level detection rate, threshold sweep
 
 ### Geospatial outputs
 
-Post-processing writes:
-- per-patch debris GeoJSON files
-- merged debris GeoJSON
-- centroid and bounding-box CSV
+- Per-patch debris GeoJSON files
+- `all_debris.geojson` — merged
+- Centroid and bounding-box CSV
 
-### Forecast outputs
+### Drift outputs
 
-Drift prediction writes:
-- trajectory GeoJSON files
-- merged drift outputs
-- uncertainty geometry if enabled in the drift logic
+- Per-object `*_drift.geojson` (T+6h, 12h, 24h, 48h, 72h positions + ellipses)
+- `all_drift.geojson` — merged
+
+---
 
 ## Configuration Reference
 
-The central settings live in `src/configs/config.py`.
+All settings live in `src/configs/config.py`. GPU presence is auto-detected at import time.
 
-### Current important settings
+| Key | CPU value | GPU value | Role |
+|---|---|---|---|
+| `ENCODER_NAME` | resnext50_32x4d | resnext101_32x8d | Backbone (auto) |
+| `BATCH_SIZE` | 8 | 32 | Real batch per step (auto) |
+| `GRAD_ACCUM` | 4 | 2 | Effective batch = 64 both ways (auto) |
+| `NUM_WORKERS` | 4 | 8 | DataLoader workers (auto) |
+| `NUM_CLASSES` | 2 | 2 | Binary segmentation |
+| `INPUT_BANDS` | 16 | 16 | 11 raw + 5 indices |
+| `CLASS_WEIGHTS` | [5.0, 1.0] | [5.0, 1.0] | Debris upweighted 5× |
+| `FOCAL_GAMMA` | 3.0 | 3.0 | Focal modulation |
+| `TVERSKY_ALPHA` | 0.3 | 0.3 | FP weight |
+| `TVERSKY_BETA` | 0.7 | 0.7 | FN weight (recall-first) |
+| `TVERSKY_WEIGHT` | 0.7 | 0.7 | Tversky fraction of loss |
+| `AUX_LOSS_WEIGHT` | 0.4 | 0.4 | Deep supervision weight |
+| `LABEL_SMOOTH` | 0.01 | 0.01 | Mild smoothing |
+| `EMA_DECAY` | 0.9998 | 0.9998 | EMA smoothing factor |
+| `ENCODER_FREEZE_EPOCHS` | 5 | 5 | Warmup freeze epochs |
+| `COPY_PASTE_PROB` | 0.4 | 0.4 | Synthetic debris rate |
+| `MIXUP_PROB` | 0.15 | 0.15 | MixUp augmentation rate |
+| `OVERSAMPLE_HEAVY` | 8 | 8 | Heavy debris patch repeat |
+| `OVERSAMPLE_LIGHT` | 4 | 4 | Light debris patch repeat |
+| `MIN_DEBRIS_PIXELS` | 3 | 3 | Post-processing min size |
 
-| Key | Current value | Role |
-|---|---:|---|
-| `NUM_CLASSES` | 2 | binary segmentation |
-| `INPUT_BANDS` | 16 | 11 raw + 5 indices |
-| `CLASS_WEIGHTS` | `[3.0, 1.0]` | moderate debris upweighting |
-| `FOCAL_GAMMA` | `2.0` | focal modulation |
-| `LABEL_SMOOTH` | `0.02` | mild smoothing |
-| `COPY_PASTE_PROB` | `0.25` | synthetic positive augmentation |
-| `OVERSAMPLE_HEAVY` | `8` | heavy positive patch duplication |
-| `OVERSAMPLE_LIGHT` | `4` | light positive patch duplication |
-| `MIN_DEBRIS_PIXELS` | `3` | post-processing minimum object size |
-
-Some legacy config keys remain in the file for historical reasons, but they are no longer part of the active training path.
+---
 
 ## Key Code Logic By File
 
 ### `src/utils/dataset.py`
 
-- builds a TIFF index once
-- loads image, mask, confidence map
-- maps original MARIDA labels to binary targets
-- computes percentile normalization statistics from the training split
-- computes and concatenates spectral indices
-- oversamples debris-containing patches
-- optionally performs copy-paste debris synthesis
-- applies geometric and radiometric augmentation
-- returns image, binary mask, confidence weights, and patch id
+- Builds a TIFF index once; avoids repeated recursive globbing
+- Loads image, mask, confidence map
+- Maps MARIDA DN→binary
+- Computes percentile normalization from training split
+- Computes and concatenates 5 spectral indices
+- Oversamples debris-containing patches (heavy/light)
+- Copy-paste debris augmentation (1–5 donors, flip/rotate/shift)
+- MixUp augmentation (image blending, dominant mask preserved)
+- Albumentations geometric and radiometric pipeline
+- Confidence weight mapping (0→0.2, 1→0.7, 2→1.0)
 
 ### `src/semantic_segmentation/models/resnext_cbam_unet.py`
 
-- defines channel and spatial attention blocks
-- defines U-Net style decoder blocks
-- adapts ResNeXt-50 to multispectral input
-- applies deep-feature CBAM attention
-- defines the current Focal-CE + Dice loss
+- CBAM: channel attention + spatial attention
+- DecoderBlock: ConvTranspose2d + double conv + Dropout2d + CBAM
+- ResNeXtCBAMUNet: dynamic backbone (50 or 101), 4-stage U-Net decoder, deep supervision aux head
+- HybridLoss: Focal-CE + log-Tversky, handles (main, aux) tuple, confidence weighting
 
 ### `src/train.py`
 
-- constructs train and validation datasets
-- trains with AMP when available
-- uses gradient accumulation and clipping
-- computes class-wise validation metrics
-- selects best model by debris F1 with recall guard
-- saves TensorBoard metrics and CSV history
+- ModelEMA class (shadow copy, apply/restore for validation)
+- Encoder freeze for first N epochs; optimizer rebuilt on unfreeze
+- Training epoch: AMP forward, aux loss routing, grad accumulation, clip, EMA update
+- Validation epoch: raw model then EMA model separately
+- SGDR scheduler with linear warmup
+- CSV + TensorBoard logging of all metrics including EMA F1 and LR
+- `best.pth` and `ema_best.pth` saved independently
 
 ### `src/evaluate.py`
 
-- loads model checkpoints
-- runs optional TTA and multi-scale TTA
-- computes confusion matrix and class metrics
-- sweeps thresholds for better debris F1
-- saves predicted GeoTIFF masks and confusion matrix image
+- Loads checkpoint and auto-detects backbone
+- Ensemble mode: averages softmax across multiple checkpoints
+- TTA (8×) and multi-scale TTA (24×)
+- Post-processing: small blob removal
+- Per-class pixel metrics (IoU, F1, precision, recall, dice)
+- Object-level patch detection metrics (patch recall, precision, F1)
+- Threshold sweep 0.15–0.80
+- AUPRC via trapezoidal integration over 200-point PR curve
+- PR curve PNG saved with AUPRC annotation and baseline
 
-### `src/postprocess.py`
+### `src/drift_prediction/drift.py`
 
-- optionally refines predictions with DenseCRF
-- removes holes and tiny objects
-- vectorizes debris regions
-- exports GeoJSON and centroid CSV tables
+- VelocityField: bilinear interpolation over lat/lon grid
+- RK4 integrator with ocean current + wind leeway + Stokes drift
+- Ensemble: 200 perturbed fields with velocity-proportional noise
+- Confidence ellipse from eigendecomposition of position covariance (95%, χ² factor 2.4477)
+- GeoJSON output: origin + trajectory points + ellipse polygons per time step
 
-### `src/utils/spectral_extraction.py`
-
-- extracts tabular per-pixel features for Random Forest experiments
-- supports bands, indices, and texture modes
-- stores per-split data in HDF5 tables
+---
 
 ## Reproducibility Checklist
 
-For a reproducible experiment or paper run, keep the following fixed and recorded:
+For a reproducible paper experiment, record:
 
-1. exact checkpoint directory and timestamped run id
-2. config values used at launch time
-3. train, validation, and test split files
-4. whether TTA or multi-scale TTA was used
-5. threshold used for headline metrics
-6. whether post-processing was applied before object export
-7. hardware context: CPU or GPU, Python version, PyTorch version
-8. whether the current slim decoder or an older wider decoder was used
+1. Exact checkpoint path and run timestamp
+2. Backbone used (resnext50 or resnext101)
+3. GPU or CPU, PyTorch version, Python version
+4. Config values at launch time
+5. Train/val/test split files (unchanged across runs)
+6. Whether TTA and which type was used
+7. Threshold used for headline pixel metrics
+8. Whether post-processing was applied before object export
+9. EMA checkpoint or raw checkpoint used for evaluation
 
 Minimum evidence to preserve for each serious experiment:
 - `metrics.csv`
-- training log
-- test evaluation log
-- final best checkpoint
-- confusion matrix image
-- threshold sweep results
+- Training log (`external_logs/train_<timestamp>.log`)
+- Evaluation log (`eval_test.log`)
+- `ema_best.pth`
+- `pr_curve_test.png`
+- `confusion_matrix_test.png`
+
+---
 
 ## Experiment Playbook
 
-The repository is now mature enough that experiments should be structured rather than ad hoc.
+### Ablation table for the paper
 
-### Recommended ablation groups
-
-1. Input ablations.
-   Compare 11-band only vs 16-channel input with spectral indices.
-
-2. Imbalance ablations.
-   Compare different class weights and copy-paste probabilities.
-
-3. Decoder-capacity ablations.
-   Compare the current slim decoder with the earlier wider decoder.
-
-4. Evaluation ablations.
-   Compare no TTA, standard TTA, and multi-scale TTA.
-
-5. Post-processing ablations.
-   Compare raw raster predictions against refined polygon outputs.
-
-### Recommended experiment table for the paper
-
-| Group | Variant | Keep fixed |
-|---|---|---|
-| Input | 11-band vs 16-band | architecture, loss, schedule |
-| Imbalance | class weights and copy-paste | architecture, threshold policy |
-| Architecture | slim vs wide decoder | data pipeline and loss |
-| Inference | base vs TTA vs MS-TTA | checkpoint |
-| Deployment | raw mask vs postprocessed polygons | evaluated predictions |
+| Variant | Backbone | Debris F1 | AUPRC | Patch Recall |
+|---|---|---|---|---|
+| RF (bands only) | — | | | |
+| RF (bands + SI + GLCM) | — | | | |
+| ResNeXt-50, 11ch (no SI) | resnext50 | | | |
+| ResNeXt-50, 16ch | resnext50 | | | |
+| + Tversky loss | resnext50 | | | |
+| + EMA + SGDR | resnext50 | | | |
+| + TTA | resnext50 | | | |
+| ResNeXt-101, 16ch + all | resnext101 | | | |
+| + MS-TTA | resnext101 | | | |
 
 ### Practical selection rule
 
-Use validation debris F1 to choose checkpoints, then report test-set behavior at both:
-- default threshold `0.5`
-- threshold-swept optimum
+Use validation debris F1 to choose checkpoints. Report test-set behavior at:
+- Default threshold 0.5
+- Threshold-swept optimum
 
-This gives a more honest picture of both raw and calibrated deployment performance.
+Report both raw checkpoint and EMA checkpoint results.
+
+---
 
 ## Known Results and Training History
 
-### Proven historical signal
+### Previous runs (CPU, resnext50)
 
-An earlier February 27 run demonstrated that the dataset can support very high debris recall when the architecture and loss path behave correctly. That run is the reason the project pivoted back toward the custom CBAM U-Net family.
+| Run | Epochs | Best val F1 | Test F1 (thr=0.80) | Test AUPRC | Notes |
+|---|---|---|---|---|---|
+| run_20260224 | ~8 | NaN (loss collapse) | — | — | Old Lovász+OHEM+EMA config, unstable |
+| run_20260227 | ~8 | ~0.60 recall, low F1 | — | — | Precision collapse, high recall |
+| run_20260303 | ~12 | ~0.03 | 0.007 | — | Architecture regression |
+| run_20260312 | short | ~0.007 | 0.007 | — | DeepLabV3+ attempt (smp), poor |
+| run_20260313 | 12 | **0.393** (ep 8) | 0.349 | — | ResNeXtCBAMUNet restored |
+| run_20260321 | 3 (smoke) | 0.012 | — | — | **New pipeline validated** (EMA, Tversky, SGDR) |
 
-### Recent evaluation behavior
+### Notes on run_20260313
 
-A more recent run showed:
-- debris recall can reach around 80 percent on test data even before full convergence
-- precision remains the harder part of the problem
-- threshold calibration changes operational behavior substantially
+- Best raw F1: 0.393 at epoch 8
+- Test F1 at thr=0.80: 0.349 (P=0.270, R=0.493)
+- Test recall: 0.803 at default threshold
+- Training instability after epoch 8 (F1 oscillated ±0.17)
 
-This means the project is now in the right regime: training is learning debris, but precision and calibration remain the main optimization target.
+The new SGDR restarts and Dropout2d directly address the post-epoch-8 instability.
 
-### Important interpretation
-
-For this repository, `90+ accuracy` is not the correct headline goal. Accuracy is easy to inflate because the negative class dominates. The meaningful research targets are:
-- high debris recall
-- usable debris precision
-- improved debris F1
-- good thresholded operational performance
+---
 
 ## Limitations
 
-The current repository is strong, but not finished in a research-perfect sense.
+- Strong class imbalance (0.45%) makes precision recovery the main challenge
+- CPU training makes ablation cycles slow (~28 min/epoch)
+- Threshold calibration is global, not scene-adaptive
+- Pixel metrics do not fully capture operational performance (object-level needed too)
+- Drift quality depends on external CMEMS/ERA5 data availability
+- EMA adds ~500MB checkpoint disk usage per run
 
-Known limitations include:
-- strong class imbalance still makes precision recovery difficult
-- current headline evaluation is still pixel-centric rather than object-centric
-- CPU training makes long ablation cycles expensive
-- threshold calibration is global, not yet scene-adaptive
-- drift forecasting quality depends on the quality and realism of external current and wind data
-- the PowerShell runner still reflects some legacy interfaces and needs synchronization over time
-
-These are not fatal issues, but they should be acknowledged clearly in any thesis, report, or paper.
+---
 
 ## How To Position The Novelty In A Paper
 
-If this repository is being written up for publication or dissertation work, the strongest framing is not “we trained a segmentation model.” That is too weak.
+The strongest framing is not "we trained a segmentation model." That is too weak.
 
-The stronger framing is:
-- binary reformulation of MARIDA for operational debris search
-- multispectral plus physically motivated spectral-index fusion
-- confidence-aware and imbalance-aware supervision pipeline
-- attention-enhanced encoder-decoder for rare marine debris segmentation
-- threshold-calibrated evaluation for operational deployment
-- raster-to-vector conversion and forecast coupling for end-to-end monitoring
+**Recommended novelty statement:**
 
-A concise novelty statement could be written like this:
+> "We propose an end-to-end marine debris monitoring workflow integrating multispectral rare-object segmentation with confidence-aware supervision, recall-first Tversky loss, EMA-stabilised training, threshold-calibrated inference with AUPRC reporting, geospatial object extraction, and downstream Lagrangian drift forecasting — evaluated with both pixel-level and object-level metrics on the MARIDA benchmark."
 
-"We propose an end-to-end marine debris monitoring workflow that integrates multispectral rare-object segmentation, confidence-aware supervision, debris-focused augmentation, threshold-calibrated inference, geospatial object extraction, and downstream drift forecasting within a single operational remote-sensing pipeline."
+### Key contributions to defend
 
-That is a stronger and more defensible research claim than describing the work as a standalone semantic segmentation experiment.
+1. Binary reformulation of MARIDA for operational debris search
+2. Multi-source input (spectral bands + hand-crafted indices)
+3. Confidence-aware + recall-first loss (Tversky + focal)
+4. EMA + SGDR for training stability under severe class imbalance
+5. Threshold-calibrated evaluation with AUPRC and patch-level detection rate
+6. End-to-end: detection → GIS objects → drift forecasting
+
+---
 
 ## Troubleshooting
 
-### Symptom: very high accuracy but useless debris detection
+### Very high accuracy but useless debris detection
+**Cause**: majority-class collapse.  
+**Fix**: Check debris recall. Adjust threshold down. Check class weights.
 
-Cause:
-- majority-class dominance
+### Recall spikes but precision near zero
+**Cause**: too much imbalance pressure.  
+**Check**: class weights, copy-paste probability, Tversky α/β balance.
 
-Check:
-- debris recall
-- debris precision
-- debris F1
+### Model predicts almost no debris
+**Cause**: underweighted positive class, threshold too high, or wrong checkpoint.  
+**Check**: threshold sweep output; use EMA checkpoint; verify CLASS_WEIGHTS.
 
-### Symptom: recall spikes but precision collapses
+### Loss is NaN
+**Cause**: usually inf/nan in the input data (edge bands with missing values).  
+**Fix**: `np.nan_to_num` is already applied in dataset.py; check that patches load correctly.
 
-Cause:
-- imbalance handling too aggressive
-- too much copy-paste or oversampling
-- threshold too low
+### Training stops at epoch N well before patience
+**Cause**: GPU OOM, or Python process killed.  
+**Fix**: Reduce `--batch`; use `--resume` to continue from last checkpoint.
 
-Current mitigation already implemented:
-- reduced class weights
-- reduced copy-paste probability
-- reduced oversampling
-- slimmer decoder
-
-### Symptom: model predicts almost no debris
-
-Cause:
-- underweighted positive class
-- wrong checkpoint
-- threshold too high
-
-Check:
-- threshold sweep output from `evaluate.py`
-- validation recall during training
-
-### Symptom: evaluation command exits with code 1 even though results print
-
-Cause:
-- PowerShell wraps Python warnings or stderr output as non-zero in some terminal contexts
-
-Interpretation:
-- if metrics are printed and outputs are saved, the evaluation usually still succeeded
-
-### Symptom: Albumentations warning on affine mode
-
-Status:
-- already fixed in the current codebase
+---
 
 ## Roadmap
 
-Recommended next research steps:
-
-1. Continue precision recovery experiments.
-   Tune threshold, oversampling, copy-paste probability, and class weights jointly rather than in isolation.
-
-2. Add calibration analysis.
-   Reliability curves, PR curves, and per-scene threshold adaptation would strengthen the paper.
-
-3. Add architecture ablations.
-   Compare the current slim decoder against the wider decoder and against the Random Forest baseline using identical splits.
-
-4. Add object-level evaluation.
-   Pixel metrics are not enough for operational debris search. Object detection success after polygonization would be stronger.
-
-5. Tighten the detection-to-drift story.
-   Use predicted debris polygons as real initialization sets and quantify forecast spread across the ensemble.
-
-## Bottom Line
-
-This repository is no longer just a generic segmentation project. It is a rare-object remote-sensing workflow that combines:
-- multispectral debris detection
-- confidence-aware supervision
-- imbalance-focused augmentation
-- threshold-calibrated evaluation
-- GIS-ready spatial export
-- downstream drift forecasting
-
-The README has been updated to reflect the code that actually exists now, the architectural changes already made, and the pieces of logic that matter for both reproducibility and research novelty.
+1. **Finish GPU training run** — 200 epochs on resnext101 with all improvements
+2. **Calibration analysis** — reliability curves, per-scene threshold adaptation
+3. **Architecture ablations** — complete the ablation table above
+4. **Object-level evaluation improvement** — IoU-based object matching (not just patch-level binary)
+5. **Drift validation** — use real CMEMS + ERA5 data, compare predicted vs observed positions
+6. **Paper write-up** — methods, experiments, ablation table, PR curve figure, drift map figure

@@ -3,15 +3,23 @@ train.py
 --------
 End-to-end training for the ResNeXt-50 + CBAM U-Net on MARIDA.
 
+Research-paper improvements over original:
+  - ModelEMA (Exponential Moving Average) for smoother generalisation
+  - CosineAnnealingWarmRestarts (SGDR) to escape instability valleys
+  - Encoder freeze for first ENCODER_FREEZE_EPOCHS (transfer learning warmup)
+  - Deep supervision support (aux logits from model during training)
+  - EMA checkpoint saved as ema_best.pth alongside best.pth
+
 Usage:
     python train.py
-    python train.py --epochs 80 --batch 4 --lr 5e-5
+    python train.py --epochs 100 --batch 8 --workers 4 --grad_accum 4 --patience 999
 """
 
 import os, sys, argparse, time, logging, copy
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -21,38 +29,61 @@ from configs.config import (
     INPUT_BANDS, NUM_CLASSES, CLASS_WEIGHTS,
     BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, PATIENCE, NUM_WORKERS,
     CHECKPOINTS_DIR, LOGS_DIR,
-    ENCODER_NAME, GRAD_ACCUM, EMA_DECAY, LABEL_SMOOTH,
-    ENCODER_FREEZE_EPOCHS, FOCAL_GAMMA,
-    USE_SWA, SWA_START_EPOCH, SWA_LR,
+    GRAD_ACCUM, LABEL_SMOOTH, FOCAL_GAMMA,
+    EMA_DECAY, ENCODER_FREEZE_EPOCHS, ENCODER_NAME,
+    TVERSKY_ALPHA, TVERSKY_BETA, TVERSKY_WEIGHT, AUX_LOSS_WEIGHT,
 )
 from utils.dataset import MARIDADataset
-import segmentation_models_pytorch as smp
-from semantic_segmentation.models.resnext_cbam_unet import HybridLoss
-from torch.optim.swa_utils import AveragedModel, SWALR
+from semantic_segmentation.models.resnext_cbam_unet import ResNeXtCBAMUNet, HybridLoss
 
 
-# ── EMA (Exponential Moving Average) ─────────────────────────────────────────
+# ── EMA Helper ────────────────────────────────────────────────────────────────
 
 class ModelEMA:
-    """Maintains an exponential moving average of model parameters.
-    Smooths out training noise, typically improves generalisation by 1-3%."""
+    """
+    Exponential Moving Average of model weights.
+    Maintains a shadow copy of the model with smoothed weights — consistently
+    outperforms raw checkpoint at test time, especially under noisy CPU training.
 
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = copy.deepcopy(model)
+    Usage:
+        ema = ModelEMA(model, decay=0.9998)
+        # after each optimiser step:
+        ema.update(model)
+        # evaluate with:
+        ema.apply_shadow()  → model now has EMA weights
+        ema.restore()       → model restored to training weights
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9998):
+        # shadow is a deepcopy kept on CPU to avoid OOM on small GPU
+        self.decay  = decay
+        self.shadow = copy.deepcopy(model).cpu()
         self.shadow.eval()
+        # disable gradients for shadow
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
     @torch.no_grad()
-    def update(self, model):
-        for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
-            s_param.data.mul_(self.decay).add_(m_param.data, alpha=1.0 - self.decay)
-        for s_buf, m_buf in zip(self.shadow.buffers(), model.buffers()):
-            s_buf.data.copy_(m_buf.data)
+    def update(self, model: nn.Module):
+        for (name, s_param), (_, m_param) in zip(
+            self.shadow.named_parameters(), model.named_parameters()
+        ):
+            s_param.data.mul_(self.decay).add_(m_param.detach().cpu().data, alpha=1.0 - self.decay)
 
     def state_dict(self):
         return self.shadow.state_dict()
+
+    def apply_shadow(self, model: nn.Module):
+        """Copy EMA weights into model for evaluation."""
+        self._backup = copy.deepcopy(model.state_dict())
+        model.load_state_dict({k: v.to(next(model.parameters()).device)
+                               for k, v in self.shadow.state_dict().items()})
+
+    def restore(self, model: nn.Module):
+        """Restore original (training) weights into model."""
+        model.load_state_dict(self._backup)
+
+
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -89,8 +120,9 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler, grad_accum=
         except Exception:
             autocast_ctx = torch.cuda.amp.autocast(enabled=(device.type == "cuda"))
         with autocast_ctx:
-            logits = model(imgs)
-            loss   = criterion(logits, masks, confs) / grad_accum
+            # model returns (main_logits, aux_logits) when training + deep_supervision=True
+            out  = model(imgs)
+            loss = criterion(out, masks, confs) / grad_accum
 
         if torch.isnan(loss):
             continue
@@ -125,7 +157,7 @@ def val_epoch(model, loader, criterion, device, num_classes):
         except Exception:
             autocast_ctx = torch.cuda.amp.autocast(enabled=(device.type == "cuda"))
         with autocast_ctx:
-            logits = model(imgs)
+            logits = model(imgs)   # eval mode → always returns single tensor
             loss   = criterion(logits, masks, confs)
 
         if torch.isnan(loss):
@@ -161,9 +193,9 @@ def val_epoch(model, loader, criterion, device, num_classes):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
-        # Maximize CPU usage
-    import torch
+    # Maximize CPU usage
     torch.set_num_threads(8)
+
     # Logging
     import datetime
     log_dir = os.path.join(LOGS_DIR, "external_logs")
@@ -175,7 +207,7 @@ def main(args):
     try:
         stream_handler.stream.reconfigure(encoding='utf-8')
     except Exception:
-        pass  # For Python <3.7 or if reconfigure is unavailable
+        pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(message)s",
@@ -196,140 +228,158 @@ def main(args):
     metrics_writer.writerow([
         "epoch", "train_loss", "val_loss", "mIoU",
         "iou_debris", "iou_not_debris",
-        "precision", "recall", "f1"
+        "precision", "recall", "f1",
+        "ema_f1", "lr"
     ])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
+    if device.type == "cuda":
+        log.info(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory // 1024**2} MB")
+        log.info(f"Backbone (auto-selected for GPU): {args.backbone}")
+    else:
+        log.info(f"Backbone (auto-selected for CPU): {args.backbone}")
+        log.info("TIP: Run on GPU tomorrow for 10-20x speedup and resnext101 backbone.")
 
     # Datasets
     train_ds = MARIDADataset("train", augment_data=True)
     val_ds   = MARIDADataset("val",   augment_data=False)
     train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
-                          num_workers=args.workers, pin_memory=True)
+                          num_workers=args.workers, pin_memory=(device.type == "cuda"))
     val_dl   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False,
-                          num_workers=args.workers, pin_memory=True)
+                          num_workers=args.workers, pin_memory=(device.type == "cuda"))
 
-    # Model: DeepLabV3+ with strong encoder for best debris detection
-    encoder = args.encoder if hasattr(args, 'encoder') and args.encoder else ENCODER_NAME
-    model = smp.DeepLabV3Plus(
-        encoder_name=encoder,
-        encoder_weights="imagenet",
+    # Model: ResNeXt-50 + CBAM U-Net + deep supervision
+    model = ResNeXtCBAMUNet(
         in_channels=INPUT_BANDS,
-        classes=NUM_CLASSES,
-        activation=None,
+        num_classes=NUM_CLASSES,
+        pretrained=True,
+        dropout=0.1,
+        deep_supervision=True,
+        backbone=args.backbone,
     ).to(device)
-    log.info(f"Encoder: {encoder}")
+    log.info(f"Architecture: ResNeXtCBAMUNet | backbone={args.backbone} | in_ch={INPUT_BANDS} | classes={NUM_CLASSES} | deep_sup=True | dropout=0.1")
     log.info(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Freeze encoder for first N epochs so decoder learns debris patterns first
-    freeze_epochs = ENCODER_FREEZE_EPOCHS
-    def set_encoder_frozen(model, frozen):
-        for name, param in model.named_parameters():
-            if name.startswith("encoder."):
-                param.requires_grad = not frozen
-    set_encoder_frozen(model, True)
-    log.info(f"Encoder frozen for first {freeze_epochs} epochs")
-
-    # EMA model (smoothed weights for better generalisation)
+    # ── EMA shadow model ──
     ema = ModelEMA(model, decay=EMA_DECAY)
-    log.info(f"EMA enabled (decay={EMA_DECAY})")
+    log.info(f"EMA decay: {EMA_DECAY}")
 
-    # SWA model (Stochastic Weight Averaging for flatter minima)
-    swa_model = None
-    swa_scheduler = None
-    if USE_SWA:
-        swa_model = AveragedModel(model)
-        log.info(f"SWA enabled (start epoch={SWA_START_EPOCH}, lr={SWA_LR})")
+    # ── Encoder freeze warmup ──
+    freeze_epochs = args.encoder_freeze if hasattr(args, 'encoder_freeze') else ENCODER_FREEZE_EPOCHS
+    if freeze_epochs > 0:
+        for name, param in model.named_parameters():
+            if any(name.startswith(enc) for enc in ["enc0", "enc1", "enc2", "enc3", "enc4", "pool"]):
+                param.requires_grad_(False)
+        frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        log.info(f"Encoder frozen for first {freeze_epochs} epochs ({frozen_params:,} params frozen)")
 
-    # Loss: Focal CE + Dice + Lovász (nodata-safe, confidence-weighted)
-    focal = True
-    focal_gamma = FOCAL_GAMMA
+    # Loss: Focal-CE + Tversky (recall-first rare-class learning)
     class_weights = np.array(CLASS_WEIGHTS, dtype=np.float32)
     criterion = HybridLoss(
         class_weights=class_weights,
-        dice_weight=0.3,
-        lovasz_weight=0.4,
-        boundary_weight=0.1,
-        use_focal=focal,
-        focal_gamma=focal_gamma,
+        tversky_weight=TVERSKY_WEIGHT,
+        use_focal=True,
+        focal_gamma=FOCAL_GAMMA,
         label_smoothing=LABEL_SMOOTH,
+        tversky_alpha=TVERSKY_ALPHA,
+        tversky_beta=TVERSKY_BETA,
+        aux_weight=AUX_LOSS_WEIGHT,
     )
-    log.info(f"Loss: Focal-CE(γ={focal_gamma}) 0.2 + Dice 0.3 + Lovász 0.4 + Boundary 0.1 | label_smooth={LABEL_SMOOTH}")
+    log.info(f"Loss: Focal-CE(γ={FOCAL_GAMMA}) + Tversky(α={TVERSKY_ALPHA},β={TVERSKY_BETA},w={TVERSKY_WEIGHT}) + AuxHead(w={AUX_LOSS_WEIGHT})")
     log.info(f"Class weights: debris={CLASS_WEIGHTS[0]}, not-debris={CLASS_WEIGHTS[1]}")
 
     # Gradient accumulation
     grad_accum = args.grad_accum if hasattr(args, 'grad_accum') and args.grad_accum else GRAD_ACCUM
     log.info(f"Gradient accumulation: {grad_accum} steps (effective batch = {args.batch * grad_accum})")
 
-    # Optimiser with warmup + cosine annealing
-    # Use separate param groups: higher LR for decoder, lower for encoder
-    encoder_params = [p for n, p in model.named_parameters() if n.startswith("encoder.")]
-    decoder_params = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
-    optimizer = optim.AdamW([
-        {"params": encoder_params, "lr": args.lr * 0.1},  # Encoder: 10x lower LR
-        {"params": decoder_params, "lr": args.lr},
-    ], weight_decay=args.weight_decay)
-    warmup_sched = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=8)
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs - 8, 1), eta_min=1e-7)
-    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[8])
+    # Optimiser: only optimise unfrozen parameters initially
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                            lr=args.lr, weight_decay=args.weight_decay)
+
+    # Scheduler: Linear warmup → SGDR (CosineAnnealingWarmRestarts)
+    # Warm restarts escape instability valleys by periodically resetting LR
+    warmup_sched  = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
+    sgdr_sched    = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=25, T_mult=2, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_sched, sgdr_sched], milestones=[5])
+    log.info("Scheduler: LinearWarmup(5ep) → SGDR(T0=25, Tmult=2, eta_min=1e-6)")
+
     try:
         scaler = torch.amp.GradScaler(device if device.type == "cuda" else None, enabled=(device.type == "cuda"))
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Resume?
-    start_epoch  = 0
-    best_iou     = 0.0
-    no_improve   = 0
-    ckpt_path    = os.path.join(ckpt_dir, "best.pth")
+    start_epoch = 0
+    best_f1     = 0.0
+    best_ema_f1 = 0.0
+    no_improve  = 0
+    ckpt_path   = os.path.join(ckpt_dir, "best.pth")
+    ema_ckpt_path = os.path.join(ckpt_dir, "ema_best.pth")
 
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ck["model"])
         optimizer.load_state_dict(ck["optimizer"])
         start_epoch = ck["epoch"] + 1
-        best_iou    = ck["best_iou"]
-        log.info(f"Resumed from epoch {start_epoch}, best mIoU={best_iou:.4f}")
+        best_f1     = ck.get("best_f1", 0.0)
+        log.info(f"Resumed from epoch {start_epoch}, best F1={best_f1:.4f}")
 
     writer = SummaryWriter(log_dir=os.path.join(LOGS_DIR, "tsboard"))
 
     log.info("─" * 60)
     patience = args.patience if hasattr(args, 'patience') else PATIENCE
+
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        # Unfreeze encoder after freeze period
-        if epoch == freeze_epochs:
-            set_encoder_frozen(model, False)
-            log.info(f">>> Encoder unfrozen at epoch {epoch+1}")
+        # ── Unfreeze encoder after warmup ──
+        if epoch == freeze_epochs and freeze_epochs > 0:
+            for param in model.parameters():
+                param.requires_grad_(True)
+            # Re-create optimizer with all parameters
+            optimizer = optim.AdamW(model.parameters(), lr=args.lr * 0.1,
+                                    weight_decay=args.weight_decay)
+            log.info(f"  ► Encoder unfrozen at epoch {epoch+1}, lr reset to {args.lr * 0.1:.2e}")
 
         train_loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler, grad_accum)
-        ema.update(model)  # Update EMA after each epoch
 
-        # Validate using EMA model (smoother, better generalisation)
-        ema_model = ema.shadow
-        val_loss, mean_iou, per_class_iou, debris_precision, debris_recall, debris_f1 = val_epoch(ema_model, val_dl, criterion, device, NUM_CLASSES)
+        # ── Update EMA after each training epoch ──
+        ema.update(model)
+
+        val_loss, mean_iou, per_class_iou, debris_precision, debris_recall, debris_f1 = \
+            val_epoch(model, val_dl, criterion, device, NUM_CLASSES)
+
+        # ── Validate EMA model ──
+        ema.apply_shadow(model)
+        _, _, _, ema_prec, ema_rec, ema_f1 = val_epoch(model, val_dl, criterion, device, NUM_CLASSES)
+        ema.restore(model)
 
         elapsed = time.time() - t0
+        current_lr = optimizer.param_groups[0]['lr']
         log.info(
             f"Epoch {epoch+1}/{args.epochs}  "
             f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-            f"mIoU={mean_iou:.4f}  ({elapsed:.1f}s)"
+            f"mIoU={mean_iou:.4f}  lr={current_lr:.2e}  ({elapsed:.1f}s)"
         )
-        print(f"[CHECKPOINT] Saving model for epoch {epoch+1} to {ckpt_dir}")
+
         # Save checkpoint for every epoch
         epoch_ckpt = {
             "epoch": epoch, "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(), "best_iou": best_iou,
+            "optimizer": optimizer.state_dict(), "best_f1": best_f1,
         }
         torch.save(epoch_ckpt, os.path.join(ckpt_dir, f"epoch_{epoch+1:03d}.pth"))
-        # Log per-class IoU and detection counts (binary)
+
+        # Log per-class IoU
         class_names = ["Debris", "Not Debris"]
         for i, (iou, cname) in enumerate(zip(per_class_iou, class_names)):
-            log.info(f"Class {i}: {cname:15s} IoU={iou:.4f}")
-        log.info(f"Debris precision: {debris_precision:.4f}  recall: {debris_recall:.4f}  F1: {debris_f1:.4f}")
-        # Warn if model is collapsing to majority class
+            log.info(f"  Class {i}: {cname:15s} IoU={iou:.4f}")
+        log.info(f"  Debris  P={debris_precision:.4f}  R={debris_recall:.4f}  F1={debris_f1:.4f}")
+        log.info(f"  [EMA]   P={ema_prec:.4f}        R={ema_rec:.4f}        F1={ema_f1:.4f}")
+
+        # Warn if collapsing to majority class
         if epoch > 5 and debris_recall < 0.01:
             log.warning(f"⚠ DEBRIS RECALL = {debris_recall:.4f} — model may be collapsing to majority class!")
 
@@ -338,76 +388,72 @@ def main(args):
             epoch+1, train_loss, val_loss, mean_iou,
             per_class_iou[0] if len(per_class_iou) > 0 else float('nan'),
             per_class_iou[1] if len(per_class_iou) > 1 else float('nan'),
-            debris_precision, debris_recall, debris_f1
+            debris_precision, debris_recall, debris_f1,
+            ema_f1, current_lr
         ])
         metrics_csv_file.flush()
 
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/val",   val_loss,   epoch)
-        writer.add_scalar("mIoU/val",   mean_iou,   epoch)
+        # TensorBoard
+        writer.add_scalar("Loss/train",       train_loss,       epoch)
+        writer.add_scalar("Loss/val",         val_loss,         epoch)
+        writer.add_scalar("mIoU/val",         mean_iou,         epoch)
         writer.add_scalar("Debris/F1",        debris_f1,        epoch)
-        writer.add_scalar("Debris/Precision",  debris_precision, epoch)
-        writer.add_scalar("Debris/Recall",     debris_recall,    epoch)
-        writer.add_scalar("Debris/IoU",        per_class_iou[0] if len(per_class_iou) > 0 else 0.0, epoch)
-        writer.add_scalar("LR/decoder",  optimizer.param_groups[-1]['lr'], epoch)
+        writer.add_scalar("Debris/F1_EMA",    ema_f1,           epoch)
+        writer.add_scalar("Debris/Precision", debris_precision,  epoch)
+        writer.add_scalar("Debris/Recall",    debris_recall,     epoch)
+        writer.add_scalar("Debris/IoU",       per_class_iou[0] if len(per_class_iou) > 0 else 0.0, epoch)
+        writer.add_scalar("LR",               current_lr,        epoch)
 
-        # SWA: update averaged model after SWA_START_EPOCH
-        if USE_SWA and swa_model is not None and epoch >= SWA_START_EPOCH:
-            swa_model.update_parameters(model)
-            if swa_scheduler is None:
-                swa_scheduler = SWALR(optimizer, swa_lr=SWA_LR)
-                log.info(f">>> SWA started at epoch {epoch+1}, switching to SWA LR={SWA_LR}")
-            swa_scheduler.step()
-        else:
-            scheduler.step()
+        scheduler.step()
 
-        # Checkpoint
-        # Save last checkpoint (for resuming)
+        # ── Save last checkpoint ──
         ck = {
             "epoch": epoch, "model": model.state_dict(),
-            "ema_model": ema.state_dict(),
-            "optimizer": optimizer.state_dict(), "best_iou": best_iou,
+            "optimizer": optimizer.state_dict(), "best_f1": best_f1,
         }
         torch.save(ck, os.path.join(ckpt_dir, "last.pth"))
 
-        # Track best checkpoint by debris F1 (our primary metric)
-        # Use combined score: F1 must be nonzero AND recall must be meaningful
-        # This prevents "best" model from being one that ignores debris entirely
-        # Save EMA model as best (smoother generalisation)
-        current_score = debris_f1
-        # Require minimum recall of 5% to count as a valid model
-        if debris_recall < 0.05:
-            current_score = 0.0
-        if current_score > best_iou:            # variable still called best_iou for resume compat
-            best_iou   = debris_f1
+        # ── Best model selection by debris F1 with minimum recall guard ──
+        current_score = debris_f1 if debris_recall >= 0.05 else 0.0
+
+        if current_score > best_f1:
+            best_f1    = debris_f1
             no_improve = 0
             best_ck = {
-                "epoch": epoch, "model": ema.state_dict(),
-                "optimizer": optimizer.state_dict(), "best_iou": best_iou,
+                "epoch": epoch, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "best_f1": best_f1,
             }
             torch.save(best_ck, ckpt_path)
             shared_best = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_best.pth")
             try:
                 import shutil
                 shutil.copy2(ckpt_path, shared_best)
-                log.info(f"  ✓ New best F1: {best_iou:.4f} (epoch {epoch+1}) — saved to {ckpt_path} and copied to {shared_best}")
+                log.info(f"  ✓ New best F1: {best_f1:.4f} (epoch {epoch+1}) → saved + copied to {shared_best}")
             except Exception as e:
-                log.warning(f"  ✓ New best F1: {best_iou:.4f} (epoch {epoch+1}) — saved to {ckpt_path}, but failed to copy to {shared_best}: {e}")
+                log.warning(f"  ✓ New best F1: {best_f1:.4f} (epoch {epoch+1}) → saved (copy failed: {e})")
         else:
             no_improve += 1
             if no_improve >= patience:
                 log.info(f"Early stopping after {patience} epochs without improvement.")
                 break
 
-    # SWA: update batch normalization stats and save SWA model
-    if USE_SWA and swa_model is not None and swa_scheduler is not None:
-        log.info("Updating SWA batch normalization statistics...")
-        torch.optim.swa_utils.update_bn(train_dl, swa_model, device=device)
-        swa_ckpt_path = os.path.join(ckpt_dir, "swa_model.pth")
-        torch.save({"model": swa_model.module.state_dict()}, swa_ckpt_path)
-        log.info(f"SWA model saved to {swa_ckpt_path}")
+        # ── Best EMA checkpoint ──
+        ema_score = ema_f1 if ema_rec >= 0.05 else 0.0
+        if ema_score > best_ema_f1:
+            best_ema_f1 = ema_f1
+            ema_ck = {
+                "epoch": epoch, "model": ema.state_dict(), "best_f1": best_ema_f1,
+            }
+            torch.save(ema_ck, ema_ckpt_path)
+            shared_ema = os.path.join(CHECKPOINTS_DIR, "resnext_cbam_ema_best.pth")
+            try:
+                import shutil
+                shutil.copy2(ema_ckpt_path, shared_ema)
+                log.info(f"  ✓ New best EMA F1: {best_ema_f1:.4f} (epoch {epoch+1}) → saved to {shared_ema}")
+            except Exception:
+                pass
 
-    log.info(f"Training complete. Best val mIoU: {best_iou:.4f}")
+    log.info(f"Training complete. Best debris F1: {best_f1:.4f}  |  Best EMA F1: {best_ema_f1:.4f}")
     metrics_csv_file.close()
     writer.close()
 
@@ -416,16 +462,20 @@ def main(args):
     import matplotlib.pyplot as plt
     metrics_df = pd.read_csv(metrics_csv_path)
     metric_names = [
-        ("train_loss", "Train Loss"),
-        ("val_loss", "Validation Loss"),
-        ("mIoU", "Mean IoU"),
-        ("iou_debris", "IoU: Debris"),
-        ("iou_not_debris", "IoU: Not Debris"),
-        ("precision", "Debris Precision"),
-        ("recall", "Debris Recall"),
-        ("f1", "Debris F1")
+        ("train_loss",    "Train Loss"),
+        ("val_loss",      "Validation Loss"),
+        ("mIoU",          "Mean IoU"),
+        ("iou_debris",    "IoU: Debris"),
+        ("iou_not_debris","IoU: Not Debris"),
+        ("precision",     "Debris Precision"),
+        ("recall",        "Debris Recall"),
+        ("f1",            "Debris F1"),
+        ("ema_f1",        "Debris F1 (EMA)"),
+        ("lr",            "Learning Rate"),
     ]
     for col, title in metric_names:
+        if col not in metrics_df.columns:
+            continue
         plt.figure()
         plt.plot(metrics_df["epoch"], metrics_df[col], marker="o")
         plt.xlabel("Epoch")
@@ -435,20 +485,35 @@ def main(args):
         plt.tight_layout()
         plt.savefig(os.path.join(ckpt_dir, f"{col}.png"))
         plt.close()
+
+    # F1 comparison: raw vs EMA on same plot
+    if "ema_f1" in metrics_df.columns and "f1" in metrics_df.columns:
+        plt.figure()
+        plt.plot(metrics_df["epoch"], metrics_df["f1"],     marker="o", label="Raw F1")
+        plt.plot(metrics_df["epoch"], metrics_df["ema_f1"], marker="s", label="EMA F1", linestyle="--")
+        plt.xlabel("Epoch"); plt.ylabel("Debris F1")
+        plt.title("Debris F1: Raw vs EMA")
+        plt.legend(); plt.grid(True); plt.tight_layout()
+        plt.savefig(os.path.join(ckpt_dir, "f1_raw_vs_ema.png"))
+        plt.close()
+
     log.info(f"Saved metric graphs to {ckpt_dir}")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs",  type=int,   default=EPOCHS)
-    p.add_argument("--batch",   type=int,   default=BATCH_SIZE)
-    p.add_argument("--lr",      type=float, default=LR)
-    p.add_argument("--workers", type=int,   default=NUM_WORKERS)
-    p.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
-    p.add_argument("--patience", type=int, default=PATIENCE)
-    p.add_argument("--encoder", type=str, default=ENCODER_NAME,
-                   help="Encoder name (e.g. resnext50_32x4d, resnext101_32x8d)")
-    p.add_argument("--grad_accum", type=int, default=GRAD_ACCUM,
+    p.add_argument("--epochs",         type=int,   default=EPOCHS)
+    p.add_argument("--batch",          type=int,   default=BATCH_SIZE)
+    p.add_argument("--lr",             type=float, default=LR)
+    p.add_argument("--workers",        type=int,   default=NUM_WORKERS)
+    p.add_argument("--weight_decay",   type=float, default=WEIGHT_DECAY)
+    p.add_argument("--patience",       type=int,   default=PATIENCE)
+    p.add_argument("--grad_accum",     type=int,   default=GRAD_ACCUM,
                    help="Gradient accumulation steps")
-    p.add_argument("--resume",  action="store_true")
+    p.add_argument("--encoder_freeze", type=int,   default=ENCODER_FREEZE_EPOCHS,
+                   help="Freeze encoder for first N epochs")
+    p.add_argument("--backbone",      type=str,   default=ENCODER_NAME,
+                   choices=["resnext50_32x4d", "resnext101_32x8d"],
+                   help="Encoder backbone. Auto-selected based on GPU/CPU if not set.")
+    p.add_argument("--resume",         action="store_true")
     main(p.parse_args())

@@ -21,6 +21,7 @@ from configs.config import (
     AUG_PROB, ELASTIC_ALPHA, ELASTIC_SIGMA,
     COPY_PASTE_PROB, OVERSAMPLE_HEAVY, OVERSAMPLE_LIGHT,
     RAW_BANDS, USE_SPECTRAL_INDICES,
+    MIXUP_PROB, MIXUP_ALPHA,
 )
 
 
@@ -150,8 +151,7 @@ def get_advanced_augment():
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-15, 15),
-                 mode=0, p=0.3),
+        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-15, 15), p=0.3),
         A.GaussNoise(std_range=(0.01, 0.03), p=0.2),
         A.ElasticTransform(alpha=ELASTIC_ALPHA, sigma=ELASTIC_SIGMA, p=0.15),
         A.GridDistortion(p=0.1),
@@ -251,7 +251,7 @@ class MARIDADataset(Dataset):
             return img, mask, conf_raw
 
         # Paste from 1 to 3 donors for more debris diversity
-        n_donors = random.randint(1, 3)
+        n_donors = random.randint(1, 5)   # increased from 3 for richer debris diversity
         for _ in range(n_donors):
             donor_pid = random.choice(self._debris_pool)
             donor_tif = _find_tif(donor_pid)
@@ -362,6 +362,37 @@ class MARIDADataset(Dataset):
         # ── Copy-paste debris augmentation (before spatial aug, after normalisation) ──
         if self.augment_data:
             img, mask, conf_raw = self._copy_paste_debris(img, mask, conf_raw)
+
+        # ── MixUp augmentation (blend two training patches) ──
+        # Applied after copy-paste so synthetic debris is not diluted
+        # Uses a soft label blending approach: masks are mixed proportionally
+        if self.augment_data and random.random() < MIXUP_PROB and len(self.patch_ids) > 1:
+            mix_lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+            mix_lam = max(mix_lam, 1.0 - mix_lam)   # keep dominant patch ≥ 0.5 weight
+            # Load another random patch from this dataset
+            mix_idx = random.randrange(len(self.patch_ids))
+            mix_pid = self.patch_ids[mix_idx]
+            mix_tif = _find_tif(mix_pid)
+            mix_mask_tif = _find_mask_tif(mix_pid)
+            if mix_tif and mix_mask_tif:
+                with rasterio.open(mix_tif) as src:
+                    mix_img = src.read(list(range(1, RAW_BANDS + 1))).astype(np.float32)
+                np.nan_to_num(mix_img, copy=False)
+                if USE_SPECTRAL_INDICES:
+                    mix_si = _compute_spectral_indices(mix_img)
+                mix_img = normalise(mix_img)
+                if USE_SPECTRAL_INDICES:
+                    mix_si = np.clip(mix_si, -3.0, 3.0)
+                    mix_si = (mix_si + 3.0) / 6.0
+                    mix_img = np.concatenate([mix_img, mix_si], axis=0)
+                with rasterio.open(mix_mask_tif) as src:
+                    mix_mask_raw = src.read(1).astype(np.int64) - 1
+                mix_mask_bin = np.full_like(mix_mask_raw, 1, dtype=np.int64)
+                mix_mask_bin[mix_mask_raw == 0]  = 0
+                mix_mask_bin[mix_mask_raw == -1] = -1
+                # Blend images; for masks use the current patch's mask (dominant)
+                # This avoids nodata confusion from the second patch
+                img = mix_lam * img + (1.0 - mix_lam) * mix_img
 
         # ── Albumentations expects (H,W,C) for images, (H,W) for mask ──
         img = np.transpose(img, (1, 2, 0))  # (H,W,B)
