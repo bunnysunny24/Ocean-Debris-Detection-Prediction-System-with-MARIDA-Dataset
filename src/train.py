@@ -342,7 +342,14 @@ def main(args):
             # Re-create optimizer with all parameters
             optimizer = optim.AdamW(model.parameters(), lr=args.lr * 0.1,
                                     weight_decay=args.weight_decay)
+            # ── CRITICAL: reconnect scheduler to new optimizer ──
+            # Without this, scheduler.step() updates the OLD optimizer and the
+            # new one is stuck at a fixed LR forever — SGDR restarts never fire.
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=25, T_mult=2, eta_min=1e-6
+            )
             log.info(f"  ► Encoder unfrozen at epoch {epoch+1}, lr reset to {args.lr * 0.1:.2e}")
+            log.info(f"  ► SGDR scheduler reconnected to new optimizer (T0=25, Tmult=2)")
 
         train_loss = train_epoch(model, train_dl, optimizer, criterion, device, scaler, grad_accum)
 

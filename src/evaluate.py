@@ -369,7 +369,7 @@ def evaluate(args):
     pr_recalls_arr    = np.array(pr_recalls)
     pr_precisions_arr = np.array(pr_precisions)
     sort_idx = np.argsort(pr_recalls_arr)
-    auprc = float(np.trapz(pr_precisions_arr[sort_idx], pr_recalls_arr[sort_idx]))
+    auprc = float(np.trapezoid(pr_precisions_arr[sort_idx], pr_recalls_arr[sort_idx]))
     log.info(f"\n  AUPRC (Area Under PR Curve): {auprc:.4f}")
     log.info(f"  [Baseline AUPRC for random classifier at {gt_debris.mean()*100:.2f}% debris: {gt_debris.mean():.4f}]")
 
@@ -394,7 +394,7 @@ def evaluate(args):
         pr_save = os.path.join(OUTPUTS_DIR, f"pr_curve_{args.split}.png")
         plt.savefig(pr_save, dpi=150)
         plt.close()
-        log.info(f"PR curve saved → {pr_save}")
+        log.info(f"PR curve saved -> {pr_save}")
     except Exception as e:
         log.warning(f"PR curve plot failed: {e}")
 
