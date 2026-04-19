@@ -49,6 +49,7 @@ Built around the MARIDA benchmark and adapted into a binary rare-object detectio
 33. How To Position The Novelty In A Paper
 34. Troubleshooting
 35. Roadmap
+36. ReadMe
 
 ---
 
